@@ -1,9 +1,10 @@
-name: Jupyter Notebook Runner
+# Notebooks 1–3 (intent example + training + usage). Notebook 1 only gets the uv `pip install --system` patch; notebooks 2–3 get the full CI patch — keep pipeline edits in this file only.
+name: LLM Router Experimental Notebook Runner 2
 
 on:
   push:
     branches:
-      - main
+      - experimental
   workflow_dispatch:
 
 concurrency:
@@ -12,20 +13,29 @@ concurrency:
 
 jobs:
   run-notebook:
-    runs-on: arc-runners-org-nvidia-ai-bp-1-gpu
+    runs-on: arc-runners-org-nvidia-ai-bp-2-gpu
     env:
-      NOTEBOOK_PATH: ./launchable/1_Deploy_LLM_Router.ipynb
+      NOTEBOOK_PATH_INTENT: ./1_IntentRouter_Example.ipynb
+      NOTEBOOK_PATH_TRAINING: ./2_Embedding_NN_Training.ipynb
+      NOTEBOOK_PATH_USAGE: ./3_Embedding_NN_Usage.ipynb
+      # Stems must match the .ipynb basenames (papermill -> stem.out.ipynb, nbconvert -> stem.html)
+      NOTEBOOK_STEM_INTENT: 1_IntentRouter_Example
+      NOTEBOOK_STEM_TRAINING: 2_Embedding_NN_Training
+      NOTEBOOK_STEM_USAGE: 3_Embedding_NN_Usage
       PYTHON_VERSION: 3.12
     steps:  
       - name: Checkout BP repository
         uses: actions/checkout@v3
-     
+        with:
+          ref: experimental
+
       - name: Set up Python
         uses: actions/setup-python@v4
         with:
           python-version: ${{ env.PYTHON_VERSION }}
           cache: 'pip'
           cache-dependency-path: |
+            pyproject.toml
             requirements.txt
             **/*.ipynb
             
@@ -33,53 +43,253 @@ jobs:
         env:
           NGC_API_Key: ${{ secrets.NGC_API_KEY }}
         run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
-          pip install papermill
-          pip install ipywidgets
-          pip install torch
+          python -m pip install --upgrade pip setuptools wheel
+          pip install papermill jupyter nbconvert
           # Get System Info
           echo "===================== System Info ====================="
           more /etc/os-release
           docker version
           docker compose version
-          
-      - name: Run Jupyter Notebook
+
+      - name: "Patch notebooks for CI (notebook 1 uv --system only; notebooks 2-3 full patch)"
+        run: |
+          python <<'PY'
+          import json, os, sys
+
+          paths = [
+              os.environ["NOTEBOOK_PATH_INTENT"],
+              os.environ["NOTEBOOK_PATH_TRAINING"],
+              os.environ["NOTEBOOK_PATH_USAGE"],
+          ]
+          clip_image_old = "jinaai/clip-as-service:latest"
+          clip_image_new = "nvcr.io/rw983xdqtcdp/auto_test_team/clip:latest"
+          uv_install_old = "subprocess.run([uv_cmd, 'pip', 'install', '.'], check=True)"
+          uv_install_new = "subprocess.run([uv_cmd, 'pip', 'install', '--system', '.'], check=True)"
+          num_samples_old = "NUM_SAMPLES = 1800  # Adjust as needed"
+          num_samples_new = "NUM_SAMPLES = 100  # Adjust as needed"
+          gpus_all = "    --gpus all \\\n"
+          gpus_dev0 = "    --gpus device=0 \\\n"
+          clip_verify_old = (
+              "# Verify CLIP server is responding\n"
+              "c = Client('grpc://0.0.0.0:51000')\n"
+              "c.profile()"
+          )
+          clip_verify_new = (
+              "# Verify CLIP server is responding\n"
+              "import time\n"
+              "c = Client('grpc://0.0.0.0:51000')\n"
+              "time.sleep(30)\n"
+              "c.profile()"
+          )
+
+          def patch_one(path: str) -> None:
+              with open(path, encoding="utf-8") as f:
+                  nb = json.load(f)
+
+              uv_patched = False
+              num_samples_patched = False
+              is_intent_nb = "1_IntentRouter_Example" in path
+              is_training_nb = "2_Embedding_NN_Training" in path
+
+              for cell in nb.get("cells", []):
+                  if cell.get("cell_type") != "code":
+                      continue
+                  src = cell.get("source", [])
+                  text = src if isinstance(src, str) else "".join(src)
+                  orig = text
+                  if clip_image_old in text:
+                      text = text.replace(clip_image_old, clip_image_new)
+                  if uv_install_old in text:
+                      text = text.replace(uv_install_old, uv_install_new)
+                      uv_patched = True
+                  if num_samples_old in text:
+                      text = text.replace(num_samples_old, num_samples_new)
+                      num_samples_patched = True
+                  if gpus_all in text:
+                      text = text.replace(gpus_all, gpus_dev0)
+                  if clip_verify_old in text and "time.sleep(30)" not in text:
+                      text = text.replace(clip_verify_old, clip_verify_new)
+                  if is_intent_nb:
+                      remote_model_wait_old = (
+                          "# First, check if the remote model is available\n"
+                          'print("Checking remote model availability...")\n'
+                      )
+                      remote_model_wait_new = (
+                          "# First, check if the remote model is available\n"
+                          "import time\n"
+                          "time.sleep(120)\n"
+                          'print("Checking remote model availability...")\n'
+                      )
+                      if remote_model_wait_old in text and "time.sleep(120)" not in text:
+                          text = text.replace(remote_model_wait_old, remote_model_wait_new)
+                  if text != orig:
+                      cell["source"] = text.splitlines(keepends=True)
+
+              code_blob = "".join(
+                  "".join(c["source"]) if isinstance(c.get("source"), list) else c.get("source", "")
+                  for c in nb.get("cells", [])
+                  if c.get("cell_type") == "code"
+              )
+              if not uv_patched and uv_install_new not in code_blob:
+                  print(f"ERROR: uv pip install line not found or missing --system in {path}", file=sys.stderr)
+                  sys.exit(1)
+              if is_intent_nb and "time.sleep(120)" not in code_blob:
+                  print(
+                      "ERROR: intent notebook missing time.sleep(120) after remote-model wait patch",
+                      file=sys.stderr,
+                  )
+                  sys.exit(1)
+              if is_training_nb:
+                  if not num_samples_patched and num_samples_new not in code_blob:
+                      print(f"ERROR: {num_samples_old!r} not found and {num_samples_new!r} missing in {path}", file=sys.stderr)
+                      sys.exit(1)
+                  if "NUM_SAMPLES = 1800" in code_blob:
+                      print(f"ERROR: NUM_SAMPLES still 1800 in {path}", file=sys.stderr)
+                      sys.exit(1)
+              if not is_intent_nb:
+                  if clip_image_old in code_blob:
+                      print(f"ERROR: {clip_image_old!r} still present after patch in {path}", file=sys.stderr)
+                      sys.exit(1)
+                  if clip_image_new not in code_blob:
+                      print(f"ERROR: expected {clip_image_new!r} in notebook after patch: {path}", file=sys.stderr)
+                      sys.exit(1)
+
+              with open(path, "w", encoding="utf-8") as f:
+                  json.dump(nb, f, indent=1, ensure_ascii=False)
+                  f.write("\n")
+
+          for p in paths:
+              print(f"Patching {p} ...")
+              patch_one(p)
+          PY
+
+      - name: Run intent notebook (1)
+        id: run_notebook_intent
         env:
-          NGC_API_Key: ${{ secrets.NGC_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          AZURE_OPENAI_ENDPOINT: ${{ secrets.AZURE_OPENAI_ENDPOINT }}
           NVIDIA_API_KEY: ${{ secrets.NGC_API_KEY }}
           NGC_CLI_API_KEY: ${{ secrets.NGC_API_KEY }}
+          NGC_API_KEY: ${{ secrets.NGC_API_KEY }}
+          TEST_DOCKER_PULL_KEY: ${{ secrets.TEST_DOCKER_PULL_KEY }}
         run: |
-          OUTPUT_NOTEBOOK="result.ipynb"
-          echo "Executing notebook: $NOTEBOOK_PATH"
-          papermill "$NOTEBOOK_PATH" "$OUTPUT_NOTEBOOK" --log-output --log-level DEBUG
+          echo "$TEST_DOCKER_PULL_KEY" | docker login nvcr.io --username '$oauthtoken' --password-stdin
+          echo "Executing notebook: $NOTEBOOK_PATH_INTENT -> ${NOTEBOOK_STEM_INTENT}.out.ipynb"
+          papermill "$NOTEBOOK_PATH_INTENT" "${NOTEBOOK_STEM_INTENT}.out.ipynb" --log-output --log-level DEBUG
           
+      - name: Run training notebook (2)
+        id: run_notebook_training
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          AZURE_OPENAI_ENDPOINT: ${{ secrets.AZURE_OPENAI_ENDPOINT }}
+          NVIDIA_API_KEY: ${{ secrets.NGC_API_KEY }}
+          NGC_CLI_API_KEY: ${{ secrets.NGC_API_KEY }}
+          NGC_API_KEY: ${{ secrets.NGC_API_KEY }}
+          TEST_DOCKER_PULL_KEY: ${{ secrets.TEST_DOCKER_PULL_KEY }}
+        run: |
+          echo "$TEST_DOCKER_PULL_KEY" | docker login nvcr.io --username '$oauthtoken' --password-stdin
+          echo "Executing notebook: $NOTEBOOK_PATH_TRAINING -> ${NOTEBOOK_STEM_TRAINING}.out.ipynb"
+          papermill "$NOTEBOOK_PATH_TRAINING" "${NOTEBOOK_STEM_TRAINING}.out.ipynb" --log-output --log-level DEBUG
+
+      - name: Run usage notebook (3)
+        id: run_notebook_usage
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          AZURE_OPENAI_ENDPOINT: ${{ secrets.AZURE_OPENAI_ENDPOINT }}
+          NVIDIA_API_KEY: ${{ secrets.NGC_API_KEY }}
+          NGC_CLI_API_KEY: ${{ secrets.NGC_API_KEY }}
+          NGC_API_KEY: ${{ secrets.NGC_API_KEY }}
+          TEST_DOCKER_PULL_KEY: ${{ secrets.TEST_DOCKER_PULL_KEY }}
+        run: |
+          echo "$TEST_DOCKER_PULL_KEY" | docker login nvcr.io --username '$oauthtoken' --password-stdin
+          echo "Executing notebook: $NOTEBOOK_PATH_USAGE -> ${NOTEBOOK_STEM_USAGE}.out.ipynb"
+          papermill "$NOTEBOOK_PATH_USAGE" "${NOTEBOOK_STEM_USAGE}.out.ipynb" --log-output --log-level DEBUG
+
       - name: Convert result to html format
         if: always()
         env:
           NGC_API_Key: ${{ secrets.NGC_API_KEY }}
         run: |
-          OUTPUT_NOTEBOOK="result.ipynb"
-          jupyter nbconvert --to html "$OUTPUT_NOTEBOOK"
+          for stem in "$NOTEBOOK_STEM_INTENT" "$NOTEBOOK_STEM_TRAINING" "$NOTEBOOK_STEM_USAGE"; do
+            ipynb="${stem}.out.ipynb"
+            if [ -f "$ipynb" ]; then
+              jupyter nbconvert --to html --output="$stem" "$ipynb"
+            else
+              echo "skip nbconvert (missing $ipynb)"
+            fi
+          done
 
       - name: Run Test Code
+        id: run_tests
         env:
           TEST_DOCKER_PULL_KEY: ${{ secrets.TEST_DOCKER_PULL_KEY }}
         run: |
           echo "======================================="
-          echo "$TEST_DOCKER_PULL_KEY" |docker login nvcr.io --username  '$oauthtoken' --password-stdin 
+          if [ ! -f "${NOTEBOOK_STEM_INTENT}.html" ] || [ ! -f "${NOTEBOOK_STEM_TRAINING}.html" ] || [ ! -f "${NOTEBOOK_STEM_USAGE}.html" ]; then
+            echo "ERROR: expected ${NOTEBOOK_STEM_INTENT}.html, ${NOTEBOOK_STEM_TRAINING}.html, and ${NOTEBOOK_STEM_USAGE}.html (from nbconvert) before pytest" >&2
+            exit 1
+          fi
+          echo "$TEST_DOCKER_PULL_KEY" | docker login nvcr.io --username '$oauthtoken' --password-stdin
           docker run \
-            -v ./result.html:/app/input/1_Deploy_LLM_Router.html \
+            -v "$(pwd)/${NOTEBOOK_STEM_INTENT}.html:/app/input/llm_router_experimental/1_IntentRouter_Example.html" \
+            -v "$(pwd)/${NOTEBOOK_STEM_TRAINING}.html:/app/input/llm_router_experimental/2_Embedding_NN_Training.html" \
+            -v "$(pwd)/${NOTEBOOK_STEM_USAGE}.html:/app/input/llm_router_experimental/3_Embedding_NN_Usage.html" \
             -v "$(pwd):/workspace" \
             nvcr.io/rw983xdqtcdp/auto_test_team/blueprint-github-test-image:latest \
-            pytest -m llm_router --disable-warnings --html=/workspace/llm_router.html
+            pytest -m llm_router_experimental --disable-warnings --html=/workspace/llm_router.html --self-contained-html
 
-      - name: Upload the result notebook as artifact
+      - name: Prepare workflow archive (notebook HTML + pytest report)
+        if: always()
+        run: |
+          mkdir -p workflow-archive
+          for stem in "$NOTEBOOK_STEM_INTENT" "$NOTEBOOK_STEM_TRAINING" "$NOTEBOOK_STEM_USAGE"; do
+            if [ -f "${stem}.html" ]; then
+              cp "${stem}.html" "workflow-archive/${stem}.html"
+            fi
+          done
+          if [ -f llm_router.html ]; then
+            cp llm_router.html workflow-archive/llm_router.html
+          fi
+          echo "======== workflow-archive ========"
+          ls -la workflow-archive/
+
+      - name: Upload workflow archive
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: result-notebook
-          path: |
-             result.html
-             /workspace/llm_router.html
+          name: workflow-archive
+          path: workflow-archive
+          if-no-files-found: warn
           retention-days: 30
+
+      - name: Set workflow result for email
+        id: set_result
+        if: always()
+        run: |
+          if [ "${{ job.status }}" = "success" ]; then
+            echo "RESULT=Success" >> "$GITHUB_OUTPUT"
+          else
+            echo "RESULT=${{ job.status }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Send mail
+        uses: dawidd6/action-send-mail@6e71c855c9a091d80a519621b9fd3e8d252ca40c
+        if: always()
+        with:
+          server_address: smtp.gmail.com
+          server_port: 587
+          username: ${{ secrets.SMTP_USERNAME }}
+          password: ${{ secrets.SMTP_PASSWORD }}
+          subject: "QA Test Workflow Result for ${{ github.repository }}"
+          to: Github-Action-Blueprint-QA@nvidia.com
+          from: github-workflow-notification@gmail.com
+          html_body: |
+            <p>Hello,</p>
+
+            <p>The workflow for repository: <strong>${{ github.repository }}</strong> has completed.<br>
+            <strong>Result:</strong> ${{ steps.set_result.outputs.RESULT }}</p>
+
+            <p>You can review the details on GitHub:<br>
+            <a href="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}">${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}</a></p>
+
+            <p>Thanks!</p>
