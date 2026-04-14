@@ -1,5 +1,5 @@
-# Notebooks 1–3 (intent example + training + usage). Notebook 1 only gets the uv `pip install --system` patch; notebooks 2–3 get the full CI patch — keep pipeline edits in this file only.
-name: LLM Router Experimental Notebook Runner 2
+# Notebooks 1–3 (intent example + training + usage). Notebook 1: uv `--system` + remote-model wait; notebooks 2–3: uv, NUM_SAMPLES, CLIP GPU line, CLIP verify sleep — keep pipeline edits in this file only.
+name: LLM Router Experimental Notebook Runner
 
 on:
   push:
@@ -13,7 +13,7 @@ concurrency:
 
 jobs:
   run-notebook:
-    runs-on: arc-runners-org-nvidia-ai-bp-2-gpu
+    runs-on: arc-runners-org-nvidia-ai-bp-1-gpu
     env:
       NOTEBOOK_PATH_INTENT: ./1_IntentRouter_Example.ipynb
       NOTEBOOK_PATH_TRAINING: ./2_Embedding_NN_Training.ipynb
@@ -22,6 +22,8 @@ jobs:
       NOTEBOOK_STEM_INTENT: 1_IntentRouter_Example
       NOTEBOOK_STEM_TRAINING: 2_Embedding_NN_Training
       NOTEBOOK_STEM_USAGE: 3_Embedding_NN_Usage
+      # Patched NUM_SAMPLES in training notebook (see patch script)
+      LLM_ROUTER_NUM_SAMPLES: 100
       PYTHON_VERSION: 3.12
     steps:  
       - name: Checkout BP repository
@@ -51,7 +53,7 @@ jobs:
           docker version
           docker compose version
 
-      - name: "Patch notebooks for CI (notebook 1 uv --system only; notebooks 2-3 full patch)"
+      - name: "Patch notebooks for CI (notebook 1 uv + wait; notebooks 2-3 uv, NUM_SAMPLES, GPU, CLIP verify sleep)"
         run: |
           python <<'PY'
           import json, os, sys
@@ -61,12 +63,11 @@ jobs:
               os.environ["NOTEBOOK_PATH_TRAINING"],
               os.environ["NOTEBOOK_PATH_USAGE"],
           ]
-          clip_image_old = "jinaai/clip-as-service:latest"
-          clip_image_new = "nvcr.io/rw983xdqtcdp/auto_test_team/clip:latest"
           uv_install_old = "subprocess.run([uv_cmd, 'pip', 'install', '.'], check=True)"
           uv_install_new = "subprocess.run([uv_cmd, 'pip', 'install', '--system', '.'], check=True)"
           num_samples_old = "NUM_SAMPLES = 1800  # Adjust as needed"
-          num_samples_new = "NUM_SAMPLES = 100  # Adjust as needed"
+          _ns = os.environ["LLM_ROUTER_NUM_SAMPLES"]
+          num_samples_new = f"NUM_SAMPLES = {_ns}  # Adjust as needed"
           gpus_all = "    --gpus all \\\n"
           gpus_dev0 = "    --gpus device=0 \\\n"
           clip_verify_old = (
@@ -97,8 +98,6 @@ jobs:
                   src = cell.get("source", [])
                   text = src if isinstance(src, str) else "".join(src)
                   orig = text
-                  if clip_image_old in text:
-                      text = text.replace(clip_image_old, clip_image_new)
                   if uv_install_old in text:
                       text = text.replace(uv_install_old, uv_install_new)
                       uv_patched = True
@@ -145,13 +144,6 @@ jobs:
                       sys.exit(1)
                   if "NUM_SAMPLES = 1800" in code_blob:
                       print(f"ERROR: NUM_SAMPLES still 1800 in {path}", file=sys.stderr)
-                      sys.exit(1)
-              if not is_intent_nb:
-                  if clip_image_old in code_blob:
-                      print(f"ERROR: {clip_image_old!r} still present after patch in {path}", file=sys.stderr)
-                      sys.exit(1)
-                  if clip_image_new not in code_blob:
-                      print(f"ERROR: expected {clip_image_new!r} in notebook after patch: {path}", file=sys.stderr)
                       sys.exit(1)
 
               with open(path, "w", encoding="utf-8") as f:
