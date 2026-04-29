@@ -81,8 +81,8 @@ routerController:
   # Option 3: Custom models (while keeping NVIDIA Cloud API)
   # config:
   #   models:
-  #     brainstorming: "meta/llama-3.1-405b-instruct"
-  #     creativity: "meta/llama-3.1-405b-instruct"
+  #     brainstorming: "meta/llama-4-maverick-17b-128e-instruct"
+  #     creativity: "meta/llama-4-maverick-17b-128e-instruct"
   
   # Option 4: Custom environment variables for local LLMs or multiple providers
   # env:
