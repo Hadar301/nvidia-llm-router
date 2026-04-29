@@ -17,11 +17,14 @@ This guide explains how to deploy the NVIDIA LLM Router on OpenShift using the p
 ### 1. Create Required Secrets
 
 ```bash
-# Create NVIDIA API key secret
+# Create namespace (replace 'your-namespace' with your preferred name)
+oc new-project your-namespace
+
+# Create NVIDIA API key secret (required for manual routing)
 oc create secret generic llm-api-keys \
   --from-literal=nvidia_api_key=nvapi-YOUR-NVIDIA-API-KEY
 
-# Create NGC registry secret for NVIDIA base images
+# Create NGC registry secret for NVIDIA base images  
 oc create secret docker-registry nvcr-secret \
   --docker-server=nvcr.io \
   --docker-username='$oauthtoken' \
@@ -31,8 +34,8 @@ oc create secret docker-registry nvcr-secret \
 ### 2. Deploy with OpenShift Support
 
 ```bash
-# Deploy with OpenShift enablement and custom images
-helm install llm-router ./helm/llm-router \
+# Complete deployment (includes both routing strategies)
+helm install llm-router ./deploy/helm/llm-router \
   --set openshift.enabled=true \
   --set app.enabled=true \
   --set routerServer.enabled=true \
@@ -40,68 +43,93 @@ helm install llm-router ./helm/llm-router \
   --set global.imageRegistry=your-registry.com/namespace/ \
   --set routerServer.image.tag=your-tag \
   --set routerController.image.tag=your-tag \
-  --set app.image.tag=your-tag \
-  --set routerServer.replicas=1
+  --set app.image.tag=your-tag
 ```
 
-> **Note**: If your GPU nodes have taints (common with g5 instances), you'll need to add tolerations. See the [GPU Configuration](#gpu-configuration) section below.
+> **Note**: 
+> - Manual routing works immediately after deployment
+> - GPU nodes with taints require additional tolerations (see [GPU Configuration](#gpu-configuration))  
+> - Triton routing requires additional model download steps (see section 4)
 
-### 3. Initialize Model Repository
+### 3. Prepare for Model Routing
 
-The LLM Router requires **both template structure and actual trained models** in the model repository. The repository provides templates but you must download the actual models separately.
+The NVIDIA LLM Router supports two routing approaches that work differently on OpenShift:
 
-#### **Option A: Full Setup (Templates + NGC Models)**
+#### **Manual Routing (Recommended)**
+- **Ready immediately**: Works with API keys, no model downloads required
+- **Production ready**: Uses NVIDIA's Build API for reliable model access
+- **OpenShift compatible**: No file transfer or storage issues
 
-For complete Triton routing functionality, use the Jupyter notebook approach:
+#### **Triton Routing (Advanced)**
+- **Requires model files**: Needs NGC model downloads and file transfers
+- **Complex setup**: File transfer challenges in OpenShift environments
+- **Development focused**: Best suited for custom model development
+
+For most users, **manual routing provides complete functionality** and is recommended for OpenShift deployments.
+
+### 4. Download and Copy Models (Optional - For Triton Routing)
+
+If you need Triton routing with NGC models, follow these steps:
+
+#### **Step 1: Download Models Locally**
 
 ```bash
-# 1. Set up NGC API key and run the blueprint notebook locally
+# Install NGC CLI and download models locally
 export NGC_CLI_API_KEY="your-ngc-api-key"
+export NGC_CLI_ORG="nvidia/nemo"
+
+# Option A: Use Makefile (requires NGC CLI setup)
+make download
+
+# Option B: Use Jupyter notebook
 jupyter lab --notebook-dir=launchable/
-
-# 2. Run 1_Deploy_LLM_Router.ipynb cells to download models
-# 3. Copy downloaded models to OpenShift PVC (see below)
+# Run 1_Deploy_LLM_Router.ipynb with NGC_API_Key set
 ```
 
-#### **Option B: Copy Local Templates (Manual Routing)**
+#### **Step 2: Transfer Models to OpenShift**
 
-For immediate testing with manual routing only, copy templates from the local repository:
+⚠️ **Warning**: This process can be unreliable with large files. Model files are ~700MB each and may get corrupted during transfer.
 
 ```bash
-# Scale down router-server to access PVC
-oc scale deployment llm-router-router-server --replicas=0 -n your-namespace
+# Get the router-server pod name
+ROUTER_POD=$(oc get pods -l app.kubernetes.io/component=router-server -o jsonpath='{.items[0].metadata.name}')
 
-# Copy model templates from local repository
-oc cp customize/router-builder/task-router/triton_template/ <temp-pod>:/model_repository/
-oc cp customize/router-builder/complexity-router/triton_template/ <temp-pod>:/model_repository/
+# Copy model files directly to running pod - these operations may fail due to large file sizes
+oc cp routers/task_router/1/model.pt $ROUTER_POD:/model_repository/task_router/1/
+oc cp routers/complexity_router/1/model.pt $ROUTER_POD:/model_repository/complexity_router/1/
 
-# Scale router-server back up
-oc scale deployment llm-router-router-server --replicas=1 -n your-namespace
+# Verify file sizes match (736MB each)
+oc exec $ROUTER_POD -- ls -lh /model_repository/*/1/model.pt
 
-echo "✅ Model templates copied"
-echo "⚠️  Note: Templates only - use manual routing strategy for testing"
+# Restart router-server to reload models
+oc rollout restart deployment/llm-router-router-server
+
+# Verify models loaded successfully
+oc logs deployment/llm-router-router-server | grep -E "successfully loaded"
 ```
 
-#### **Copying Downloaded Models to OpenShift**
+**Common Issues**:
+- `oc cp` may fail with "unexpected EOF" for large files
+- File corruption during transfer (check file sizes)  
+- Network timeouts with 700MB+ files
+- May require multiple retry attempts
 
-After running the notebook locally to download NGC models:
-
+**Troubleshooting**:
 ```bash
-# 1. Scale down router-server to access PVC
-oc scale deployment llm-router-router-server --replicas=0 -n your-namespace
+# If transfer fails, verify source file size
+ls -lh routers/*/1/model.pt
 
-# 2. Copy downloaded models from local routers/ directory
-oc cp routers/task_router/1/model.pt <router-server-pod>:/model_repository/task_router/1/
-oc cp routers/complexity_router/1/model.pt <router-server-pod>:/model_repository/complexity_router/1/
+# Check if transferred file is complete (should be ~736MB each)
+ROUTER_POD=$(oc get pods -l app.kubernetes.io/component=router-server -o jsonpath='{.items[0].metadata.name}')
+oc exec $ROUTER_POD -- ls -lh /model_repository/*/1/model.pt
 
-# 3. Scale router-server back up
-oc scale deployment llm-router-router-server --replicas=1 -n your-namespace
-
-# 4. Verify models loaded successfully
-oc logs deployment/llm-router-router-server | grep -E "model.*loaded|ready"
+# If corrupted, delete and retry
+oc exec $ROUTER_POD -- rm /model_repository/*/1/model.pt
 ```
 
-### 4. Access the Application
+> **Alternative**: Manual routing provides the same functionality without these file transfer complications.
+
+### 5. Access the Application
 
 ```bash
 # Get the route URLs
@@ -113,21 +141,38 @@ https://llm-router-app-<your-namespace>.<cluster-domain>/
 
 ## Routing Strategies
 
-The NVIDIA LLM Router supports two routing strategies:
+The NVIDIA LLM Router supports two approaches for routing requests to language models:
 
-### Manual Routing (Recommended for Production)
-- **Direct model selection**: Choose specific models from the configured policies
-- **Uses NVIDIA API directly**: Routes to models via NVIDIA's Build API
-- **Immediate functionality**: Works out-of-the-box with proper API keys
-- **Best for**: Production deployments, specific model requirements
+### Manual Routing (Recommended)
+**What it does**: Direct model selection based on predefined policies and user preferences
 
-### Triton Routing (Requires Trained Models)  
-- **ML-based routing**: Uses Triton Inference Server with routing models
-- **Requires training**: Needs actual trained routing models (not provided)
-- **Complex setup**: Requires model training and Triton configuration
-- **Best for**: Advanced use cases with custom-trained routing logic
+**Advantages**:
+- ✅ **Ready immediately**: Works with just NVIDIA API keys
+- ✅ **Reliable**: Uses NVIDIA's Build API infrastructure  
+- ✅ **OpenShift compatible**: No file transfers or storage complexity
+- ✅ **Production ready**: Proven reliability for enterprise deployments
+- ✅ **Full functionality**: Complete LLM Router capabilities
 
-> **Default Configuration**: The demo app uses manual routing by default since the Triton routing models in the repository are template/stub models for development purposes only.
+**Use cases**:
+- Production deployments
+- Testing and evaluation
+- When you want reliable model routing without infrastructure complexity
+
+### Triton Routing (Advanced)
+**What it does**: ML-based routing using Triton Inference Server with custom routing models
+
+**Requirements**:
+- ❗ **NGC model downloads**: Requires downloading ~700MB model files
+- ❗ **File transfers**: Complex model file management in OpenShift
+- ❗ **Storage overhead**: Significant PVC space requirements
+- ❗ **Cache configuration**: HuggingFace model caching setup
+
+**Use cases**:
+- Custom model development
+- Research environments
+- When you need ML-based routing decisions
+
+> **Recommendation**: Start with manual routing for immediate functionality. Triton routing adds operational complexity without additional end-user features for most use cases.
 
 ## OpenShift-Specific Features
 
@@ -214,7 +259,7 @@ routerServer:
 
 **Deploy with cache configuration:**
 ```bash
-helm install llm-router ./helm/llm-router \
+helm install llm-router ./deploy/helm/llm-router \
   --set openshift.enabled=true \
   --set routerServer.env[0].name=HF_DATASETS_CACHE \
   --set routerServer.env[0].value="/tmp/hf_cache" \
@@ -295,7 +340,7 @@ tolerations:
 
 Deploy with tolerations:
 ```bash
-helm install llm-router ./helm/llm-router \
+helm install llm-router ./deploy/helm/llm-router \
   --set openshift.enabled=true \
   --set routerServer.enabled=true \
   --set global.imageRegistry=your-registry.com/namespace/ \
@@ -315,218 +360,72 @@ oc describe node <gpu-node-name> | grep Taints
 ```
 
 ### Model Repository Issues
-If Triton fails to load models:
+If Triton routing fails to load models:
 
 ```bash
-# Check if template loader job completed successfully
-oc get jobs
-oc logs job/llm-router-template-loader
-
 # Verify repository structure
 oc exec deployment/llm-router-router-server -- find /model_repository -type f | head -20
 
-# Check for actual model files (.pt files)
-oc exec deployment/llm-router-router-server -- find /model_repository -name "*.pt"
+# Check for actual model files (.pt files) - these are large (700MB+)
+oc exec deployment/llm-router-router-server -- find /model_repository -name "*.pt" -exec ls -lh {} \;
 
 # Check Triton server logs for detailed loading errors  
 oc logs deployment/llm-router-router-server | grep -E "model|error|fail"
-
-# Common issues:
-# 1. Empty .gitkeep files instead of real models
-# 2. Templates present but no NGC model files
-# 3. Cache permission errors for preprocessing models
 ```
 
-### Triton Routing Not Working
+**Common Issues:**
+1. **Missing model files** - Repository contains only template structure
+2. **Corrupted transfers** - Large model files corrupted during pod-to-pod copy
+3. **Cache permission errors** - HuggingFace models fail due to OpenShift security contexts
+4. **Insufficient storage** - PVC too small for 700MB+ model files
 
-If you see "Request for unknown model" errors, this typically means Triton has no loaded models:
+**Solutions:**
+- Ensure cache configuration is applied (see Cache Configuration section)
+- Use temporary pod method for reliable large file transfers (see model download section)  
+- Verify PVC has sufficient space (recommend 100Gi+)
+- Consider manual routing as alternative
 
-#### **Root Cause: Missing Model Files**
+### Routing Strategy Issues
 
-The repository contains **template configurations** but requires downloading **actual trained models** from NGC:
+If routing doesn't work as expected:
+
+#### **Manual Routing Issues**
+```bash
+# Check NVIDIA API key is set
+oc get secret llm-api-keys -o yaml
+oc logs deployment/llm-router-router-controller | grep -i "api"
+
+# Test API connectivity from inside cluster
+oc exec <router-controller-pod> -- curl -s https://api.nvidia.com/v1/models \
+  -H "Authorization: Bearer ${NVIDIA_API_KEY}"
+
+# Verify router controller is accessible
+curl https://<router-controller-route>/v1/models
+```
+
+**Common Solutions:**
+- Ensure NVIDIA API key is valid and has model access permissions
+- Check network connectivity to api.nvidia.com
+- Verify router-controller service is accessible via OpenShift route
+
+#### **Triton Routing Issues**  
+If using Triton routing and seeing "Request for unknown model" errors:
 
 ```bash
 # Check if models are loaded in Triton
 curl https://<router-server-route>/v2/models
 
-# Check Triton logs for loading errors  
-oc logs deployment/llm-router-router-server
+# Check Triton server logs
+oc logs deployment/llm-router-router-server | grep -E "model|loaded|failed"
 ```
 
-Common error messages and solutions:
+**Common Solutions:**
+- Verify NGC model files were transferred successfully (see model download section)
+- Ensure cache configuration is applied (see Cache Configuration section)
+- Check PVC has sufficient space for model files
+- Use manual routing as alternative - provides same functionality
 
-**1. "failed to load all models"** - No valid models in repository:
-- Repository only contains template structure
-- Need to download actual `.pt` model files from NGC
-
-**2. "PytorchStreamReader failed reading zip archive: not a ZIP archive"** - Invalid model files:
-- Placeholder or corrupted model files
-- Need actual PyTorch model files from `make download`
-
-**3. "PermissionError: [Errno 13] Permission denied: '/.cache'"** - Cache permissions:
-- **Root Cause**: OpenShift security contexts prevent writing to root filesystem (`/.cache`)
-- **Impact**: HuggingFace Python preprocessing/postprocessing models fail to download
-- **Symptom**: Triton ensemble models fail to load, preventing ML-based routing
-- **Solution**: Deploy with cache configuration (see [Cache Configuration](#cache-configuration-required-for-openshift) section)
-- This is **required for all OpenShift deployments** due to security context restrictions
-
-#### **Solution: Download NGC Models**
-
-The blueprint requires running `make download` to populate actual models:
-
-```bash
-# Download models locally (requires NGC CLI and API key)
-export NGC_CLI_API_KEY="your-ngc-key"
-export NGC_CLI_ORG="nvidia/nemo"
-make download
-
-# Or use Jupyter notebook approach:
-# Run launchable/1_Deploy_LLM_Router.ipynb with NGC_API_Key set
-```
-
-#### **Alternative: Use Manual Routing**
-
-Manual routing works immediately without NGC models:
-
-1. **Switch to manual routing strategy in the Gradio UI**
-2. **Test with OpenAI-compatible API calls directly**
-3. **Verify router-controller configuration has valid NVIDIA_API_KEY**
-
-Manual routing provides **complete LLM Router functionality** for evaluation and testing.
-
-### Understanding Triton Inference Server Failures in OpenShift
-
-This section explains the specific challenges encountered when deploying Triton Inference Server on OpenShift and how to resolve them.
-
-#### **The Complete Failure Scenario**
-
-When deploying the NVIDIA LLM Router on OpenShift, you may encounter this sequence of failures:
-
-1. **Triton starts successfully** but shows "failed to load all models"
-2. **Models table is empty** when checking `/v2/models` endpoint
-3. **ML-based routing fails** with "Request for unknown model" errors
-4. **Only manual routing works** via router-controller
-
-#### **Root Cause Analysis**
-
-The failure occurs due to **OpenShift's security restrictions** interacting with **HuggingFace model downloads**:
-
-```bash
-# Typical error in Triton logs:
-E0428 12:20:22.188450 1 model_repository_manager.cc:1460] 
-"Poll failed for model directory 'lost+found': Invalid model name"
-
-# Hidden underlying cause (not visible in Triton logs):
-PermissionError: [Errno 13] Permission denied: '/.cache'
-```
-
-**Technical Details:**
-
-1. **OpenShift Security Contexts**: 
-   - `runAsNonRoot: true` prevents root filesystem writes
-   - `allowPrivilegeEscalation: false` restricts privilege changes
-   - `restricted-v2` SCC blocks access to `/` directory
-
-2. **HuggingFace Behavior**:
-   - Python preprocessing models attempt to cache to `~/.cache/huggingface/`
-   - When `HOME=/` (default), this becomes `/.cache/huggingface/`
-   - OpenShift blocks this write operation
-
-3. **Triton Ensemble Impact**:
-   - Ensemble models depend on preprocessing/postprocessing steps
-   - Cache permission errors cause Python backend models to fail
-   - Failed dependencies prevent entire ensemble from loading
-
-#### **The Solution: Cache Redirection**
-
-The fix involves redirecting HuggingFace cache to a writable location:
-
-**Environment Variables:**
-```yaml
-env:
-  - name: HF_DATASETS_CACHE
-    value: "/tmp/hf_cache"
-  - name: HUGGINGFACE_HUB_CACHE
-    value: "/tmp/hf_cache"
-  - name: TRANSFORMERS_CACHE
-    value: "/tmp/hf_cache"
-  - name: HOME
-    value: "/tmp"
-```
-
-**Volume Configuration:**
-```yaml
-extraVolumes:
-  - name: hf-cache
-    emptyDir: {}
-extraVolumeMounts:
-  - name: hf-cache
-    mountPath: /tmp/hf_cache
-```
-
-#### **Verification Steps**
-
-After applying the cache fix, verify it's working:
-
-```bash
-# 1. Check environment variables are set
-oc exec <router-server-pod> -- env | grep -E "(HF_|TRANSFORM|HOME)"
-
-# Expected output:
-# HF_DATASETS_CACHE=/tmp/hf_cache
-# HUGGINGFACE_HUB_CACHE=/tmp/hf_cache  
-# TRANSFORMERS_CACHE=/tmp/hf_cache
-# HOME=/tmp
-
-# 2. Check cache directory is writable
-oc exec <router-server-pod> -- ls -la /tmp/hf_cache
-
-# Expected output:
-# drwxrwsrwx. 2 root 1000970000  6 Apr 28 12:20 .
-
-# 3. Check Triton can now load models (after adding model files)
-curl https://<router-server-route>/v2/models
-```
-
-#### **Why This Wasn't Obvious**
-
-This issue was particularly challenging to diagnose because:
-
-1. **Triton logs don't show the real error** - they show model loading failures, not permission errors
-2. **The error occurs in Python backends** - hidden from main Triton process logs  
-3. **Manual routing still works** - making it seem like a Triton-specific issue
-4. **Standard Kubernetes deployments work** - the issue is OpenShift-specific
-
-#### **Implementation in Helm Chart**
-
-The cache configuration is now built into the helm chart (not a post-deployment patch):
-
-```bash
-# Deploy with cache configuration from start:
-helm install llm-router ./helm/llm-router \
-  --set openshift.enabled=true \
-  --set routerServer.env[0].name=HF_DATASETS_CACHE \
-  --set routerServer.env[0].value="/tmp/hf_cache" \
-  # ... additional cache environment variables
-```
-
-Or use a values file:
-```yaml
-# cache-config.yaml
-routerServer:
-  env:
-    - name: HF_DATASETS_CACHE
-      value: "/tmp/hf_cache"
-    # ... other cache variables
-  extraVolumes:
-    - name: hf-cache
-      emptyDir: {}
-  extraVolumeMounts:
-    - name: hf-cache
-      mountPath: /tmp/hf_cache
-```
-
-This cache fix is **mandatory for all OpenShift deployments** and should be included from the initial installation, not applied as an afterthought.
+> **Recommendation**: For production deployments, manual routing provides reliable functionality without the complexity of model file management.
 
 ### Image Pull Issues
 If images fail to pull:
