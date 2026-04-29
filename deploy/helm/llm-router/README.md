@@ -50,8 +50,8 @@ kubectl create secret generic multi-provider-keys \
 routerController:
   config:
     models:
-      brainstorming: "meta/llama-3.1-405b-instruct"  # Upgrade to larger model
-      creativity: "meta/llama-3.1-405b-instruct"     # Upgrade to larger model
+      brainstorming: "meta/llama-4-maverick-17b-128e-instruct"  # Upgrade to larger model
+      creativity: "meta/llama-4-maverick-17b-128e-instruct"     # Upgrade to larger model
 ```
 
 **Custom secret configuration:**
@@ -78,7 +78,7 @@ routerController:
             - name: Brainstorming
               api_base: http://your-local-llm-service:8000/v1
               api_key: ${NVIDIA_API_KEY}
-              model: meta/llama-3.1-405b-instruct
+              model: meta/llama-4-maverick-17b-128e-instruct
 ```
 
 **External ConfigMap:**

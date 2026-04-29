@@ -12,7 +12,7 @@ routerController:
             - name: Brainstorming
               api_base: http://your-local-llm-service:8000/v1
               api_key: ${NVIDIA_API_KEY}
-              model: meta/llama-3.1-405b-instruct
+              model: meta/llama-4-maverick-17b-128e-instruct
             - name: Chatbot
               api_base: http://your-local-llm-service:8000/v1
               api_key: ${NVIDIA_API_KEY}
@@ -63,7 +63,7 @@ routerController:
             - name: Creativity
               api_base: http://your-local-llm-service:8000/v1
               api_key: ${NVIDIA_API_KEY}
-              model: meta/llama-3.1-405b-instruct
+              model: meta/llama-4-maverick-17b-128e-instruct
             - name: Reasoning
               api_base: http://your-local-llm-service:8000/v1
               api_key: ${NVIDIA_API_KEY}
