@@ -59,4 +59,47 @@ Create the name of the service account to use
 {{- else }}
 {{- default "default" .Values.serviceAccount.name }}
 {{- end }}
+{{- end }}
+
+{{/*
+OpenShift-compatible pod security context
+*/}}
+{{- define "llm-router.podSecurityContext" -}}
+{{- if .Values.openshift.enabled }}
+runAsNonRoot: true
+seccompProfile:
+  type: RuntimeDefault
+{{- else }}
+runAsNonRoot: true
+runAsUser: 65534
+runAsGroup: 65534
+fsGroup: 65534
+seccompProfile:
+  type: RuntimeDefault
+{{- end }}
+{{- end }}
+
+{{/*
+OpenShift-compatible container security context
+*/}}
+{{- define "llm-router.containerSecurityContext" -}}
+allowPrivilegeEscalation: false
+capabilities:
+  drop:
+    - ALL
+{{- if not .Values.openshift.enabled }}
+runAsUser: 65534
+runAsGroup: 65534
+{{- end }}
+{{- end }}
+
+{{/*
+Storage class selection for OpenShift vs K8s
+*/}}
+{{- define "llm-router.storageClass" -}}
+{{- if .Values.openshift.enabled }}
+{{- .Values.openshift.storageClass | default "gp3-csi" }}
+{{- else }}
+{{- .Values.global.storageClass | default "" }}
+{{- end }}
 {{- end }} 

@@ -7,6 +7,28 @@ global:
 # NOTE: API keys are managed via user-created Kubernetes secrets
 # See README.md for instructions on creating the required secrets
 
+# OpenShift-specific configuration (DISABLED BY DEFAULT for backward compatibility)
+openshift:
+  enabled: false                    # DEFAULT: false - Toggle for OpenShift-specific features
+  storageClass: "gp3-csi"          # Default OpenShift storage class
+  routes:
+    enabled: true                   # Enable Routes when on OpenShift
+    router:
+      host: ""                     # Auto-generated if empty
+      enabled: true
+    controller:
+      host: ""
+      enabled: true
+    app:
+      host: ""
+      enabled: true                # Only if app.enabled is true
+
+# Service Account (missing from current chart)
+serviceAccount:
+  create: true
+  annotations: {}
+  name: ""
+
 # Resource Management (disabled by default - enable for production environments)
 # Provides namespace-level resource quotas and container limits
 resourceManagement:
@@ -277,6 +299,33 @@ routerServer:
         hostPath:
           enabled: false
           path: ""
+
+  # Environment variables for HuggingFace cache (required for OpenShift)
+  env: []
+  # Example OpenShift cache configuration:
+  # env:
+  #   - name: HF_DATASETS_CACHE
+  #     value: "/tmp/hf_cache"
+  #   - name: HUGGINGFACE_HUB_CACHE
+  #     value: "/tmp/hf_cache"
+  #   - name: TRANSFORMERS_CACHE
+  #     value: "/tmp/hf_cache"
+  #   - name: HOME
+  #     value: "/tmp"
+
+  # Extra volumes (for cache directories, etc.)
+  extraVolumes: []
+  # Example cache volume:
+  # extraVolumes:
+  #   - name: hf-cache
+  #     emptyDir: {}
+
+  # Extra volume mounts
+  extraVolumeMounts: []
+  # Example cache volume mount:
+  # extraVolumeMounts:
+  #   - name: hf-cache
+  #     mountPath: /tmp/hf_cache
 
   shm_size: "8G"
 

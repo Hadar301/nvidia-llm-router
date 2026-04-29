@@ -12,7 +12,13 @@ spec:
   resources:
     requests:
       storage: {{ .Values.routerServer.volumes.modelRepository.storage.persistentVolumeClaim.size }}
+  {{- $storageClass := "" }}
   {{- if .Values.routerServer.volumes.modelRepository.storage.persistentVolumeClaim.storageClass }}
-  storageClassName: {{ .Values.routerServer.volumes.modelRepository.storage.persistentVolumeClaim.storageClass }}
+    {{- $storageClass = .Values.routerServer.volumes.modelRepository.storage.persistentVolumeClaim.storageClass }}
+  {{- else }}
+    {{- $storageClass = include "llm-router.storageClass" . }}
+  {{- end }}
+  {{- if $storageClass }}
+  storageClassName: {{ $storageClass }}
   {{- end }}
 {{- end }} 
