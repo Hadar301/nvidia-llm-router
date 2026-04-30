@@ -8,7 +8,7 @@ metadata:
     app.kubernetes.io/component: router-server
 spec:
   accessModes:
-    - {{ .Values.routerServer.volumes.modelRepository.storage.persistentVolumeClaim.accessMode }}
+    - {{ include "llm-router.accessMode" . }}
   resources:
     requests:
       storage: {{ .Values.routerServer.volumes.modelRepository.storage.persistentVolumeClaim.size }}

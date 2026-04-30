@@ -98,8 +98,19 @@ Storage class selection for OpenShift vs K8s
 */}}
 {{- define "llm-router.storageClass" -}}
 {{- if .Values.openshift.enabled }}
-{{- .Values.openshift.storageClass | default "gp3-csi" }}
+{{- .Values.openshift.storageClass | default "ocs-storagecluster-cephfs" }}
 {{- else }}
 {{- .Values.global.storageClass | default "" }}
 {{- end }}
-{{- end }} 
+{{- end }}
+
+{{/*
+Determine PVC access mode based on OpenShift configuration
+*/}}
+{{- define "llm-router.accessMode" -}}
+{{- if .Values.openshift.enabled -}}
+ReadWriteMany
+{{- else -}}
+{{- .Values.routerServer.volumes.modelRepository.storage.persistentVolumeClaim.accessMode | default "ReadWriteOnce" -}}
+{{- end -}}
+{{- end -}} 

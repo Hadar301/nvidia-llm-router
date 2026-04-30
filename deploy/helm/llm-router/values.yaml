@@ -10,7 +10,10 @@ global:
 # OpenShift-specific configuration (DISABLED BY DEFAULT for backward compatibility)
 openshift:
   enabled: false                    # DEFAULT: false - Toggle for OpenShift-specific features
-  storageClass: "gp3-csi"          # Default OpenShift storage class
+  storageClass: "ocs-storagecluster-cephfs"  # Default to CephFS for RWX support on RHOAI
+  # Alternative storage classes:
+  # - "gp3-csi" (EBS) - ReadWriteOnce only, cheaper but no concurrent access
+  # - "ocs-storagecluster-cephfs" (CephFS) - ReadWriteMany, allows multiple pod access
   routes:
     enabled: true                   # Enable Routes when on OpenShift
     router:
@@ -277,8 +280,8 @@ routerServer:
         # Use PersistentVolumeClaim (recommended for production)
         persistentVolumeClaim:
           enabled: true
-          storageClass: ""  # Use default storage class if empty
-          accessMode: ReadWriteOnce
+          storageClass: ""  # Use default storage class if empty (see openshift.storageClass for OpenShift)
+          accessMode: ReadWriteOnce  # Changed to ReadWriteMany automatically when openshift.enabled=true
           size: "100Gi"
           # Optionally specify an existing PVC name
           existingClaim: ""
