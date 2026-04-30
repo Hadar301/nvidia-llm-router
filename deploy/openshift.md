@@ -26,81 +26,24 @@ This guide explains how to deploy the NVIDIA LLM Router on OpenShift using the p
 - **Container Images**: router-server component built for your architecture
 - **GPU Node Configuration**: Tolerations for tainted GPU nodes (if applicable)
 
-### Cluster Resource Verification
-
-```bash
-# Check cluster resources before deployment
-echo "=== Cluster Resource Check ==="
-
-# Check for GPU nodes
-GPU_NODES=$(oc get nodes -l feature.node.kubernetes.io/pci-10de.present=true --no-headers 2>/dev/null | wc -l)
-if [ "$GPU_NODES" -eq 0 ]; then
-  echo "⚠️  Warning: No GPU nodes detected. Manual routing only."
-else
-  echo "✅ GPU nodes available: $GPU_NODES"
-  oc get nodes -l feature.node.kubernetes.io/pci-10de.present=true -o custom-columns=NAME:.metadata.name,GPU:.status.allocatable.nvidia\.com/gpu
-fi
-
-# Check storage classes
-echo -e "\n=== Available Storage Classes ==="
-oc get storageclass -o custom-columns=NAME:.metadata.name,PROVISIONER:.provisioner,RECLAIM:.reclaimPolicy
-
-# Check for RWX storage
-RWX_STORAGE=$(oc get storageclass -o json | jq -r '.items[] | select(.volumeBindingMode != "WaitForFirstConsumer") | .metadata.name' | grep -E "(ceph|nfs|efs)" | head -1)
-if [ -n "$RWX_STORAGE" ]; then
-  echo "✅ RWX-compatible storage class found: $RWX_STORAGE"
-else
-  echo "⚠️  Warning: No obvious RWX storage class found. Verify with cluster admin."
-fi
-
-# Check NVIDIA GPU Operator
-echo -e "\n=== NVIDIA GPU Operator Status ==="
-if oc get pods -n nvidia-gpu-operator &>/dev/null; then
-  oc get pods -n nvidia-gpu-operator --no-headers | awk '{print $1 ": " $3}'
-else
-  echo "❌ NVIDIA GPU Operator not found. Install before proceeding with Triton routing."
-fi
-
-echo -e "\n=== Network Connectivity Test ==="
-# Test egress to NVIDIA APIs
-curl -s --max-time 5 https://api.nvidia.com/healthcheck && echo "✅ NVIDIA API accessible" || echo "❌ NVIDIA API unreachable"
-curl -s --max-time 5 https://api.ngc.nvidia.com/v2/resources &>/dev/null && echo "✅ NGC API accessible" || echo "❌ NGC API unreachable"
-```
 
 ## Routing Strategy Overview
 
-The NVIDIA LLM Router supports two routing approaches with **different infrastructure requirements**:
+The NVIDIA LLM Router supports two routing strategies. For detailed architecture and component information, see the [main project documentation](../README.md#software-components).
 
-### Manual Routing (Recommended for Production)
-- **What it is**: Direct policy-based routing to NVIDIA's hosted models  
-- **Components**: router-controller + app (demo)
-- **Infrastructure**: Standard OpenShift nodes (no GPU required)
-- **Cost**: Low - uses standard compute instances
-- **Setup**: Simple - works immediately with NVIDIA API keys
+### Manual Routing
+- **Direct policy-based routing** to NVIDIA's hosted models via Build API
+- **Requirements**: Standard OpenShift nodes, NVIDIA API key
+- **Use case**: Production deployments, immediate functionality
 
-### Triton Routing (Advanced/Development)
-- **What it is**: ML-based classification using local routing models
-- **Components**: router-controller + router-server + app (demo)  
-- **Infrastructure**: GPU nodes (16GB+ VRAM required)
-- **Cost**: High - requires expensive GPU instances
-- **Setup**: Complex - model downloads, file transfers, cache configuration
+### Triton Routing  
+- **ML-based routing decisions** using local classification models
+- **Requirements**: GPU nodes (16GB+ VRAM), NGC model downloads
+- **Use case**: Custom routing logic, research environments
 
-### Which Should You Choose?
+> **Recommendation**: Start with manual routing for immediate functionality. See [NVIDIA's routing strategy documentation](https://docs.nvidia.com/nim/llm-router/latest/routing.html) for detailed comparison.
 
-**Choose Manual Routing if**:
-- ✅ You want production-ready deployment
-- ✅ You need cost-effective infrastructure
-- ✅ You want immediate functionality
-- ✅ You're evaluating the LLM Router
-- ✅ Policy-based routing meets your needs
-
-**Choose Triton Routing only if**:
-- 🔬 You need custom ML-based routing logic
-- 🔬 You're doing research/development work
-- 🔬 You have budget for GPU infrastructure
-- 🔬 You can handle complex model file management
-
-## Quick Start
+## Deployment Steps
 
 ### 1. Create Required Secrets
 
@@ -268,25 +211,46 @@ spec:
     args:
     - -c
     - |
+      echo "Installing system dependencies..."
+      yum install -y curl wget unzip libxcrypt-compat
+
+      echo "Creating routers directory..."
       cd /workspace
       mkdir -p routers
+
+      echo "Running make download..."
       export NGC_CLI_API_KEY="$NGC_API_KEY"
       export NGC_CLI_ORG="nvidia/nemo"
       make download
 
+      echo "Download completed. Setting up model repository..."
+
       # Create model repository structure
-      mkdir -p /model_repository/{task_router,complexity_router}/1
-      mkdir -p /model_repository/{task_router_ensemble,complexity_router_ensemble}/1
-      mkdir -p /model_repository/{preprocessing_task_router,postprocessing_task_router}/1
-      mkdir -p /model_repository/{preprocessing_complexity_router,postprocessing_complexity_router}/1
+      mkdir -p /model_repository/task_router/1
+      mkdir -p /model_repository/complexity_router/1
+      mkdir -p /model_repository/task_router_ensemble/1
+      mkdir -p /model_repository/complexity_router_ensemble/1
+      mkdir -p /model_repository/preprocessing_task_router/1
+      mkdir -p /model_repository/postprocessing_task_router/1
+      mkdir -p /model_repository/preprocessing_complexity_router/1
+      mkdir -p /model_repository/postprocessing_complexity_router/1
 
       # Copy models (702MB each)
       cp -v routers/task_router/1/model.pt /model_repository/task_router/1/model.pt
       cp -v routers/complexity_router/1/model.pt /model_repository/complexity_router/1/model.pt
 
-      # Copy configuration and Python files
-      find routers/ -name "*.py" -exec cp -v {} /model_repository/$(dirname {} | sed 's|routers/||')/ \;
-      find routers/ -name "config.pbtxt" -exec cp -v {} /model_repository/$(dirname {} | sed 's|routers/||')/ \;
+      # Copy configuration and Python files with correct paths
+      for py_file in $(find routers/ -name "*.py"); do
+        rel_path=$(echo "$py_file" | sed 's|routers/||')
+        dest_dir="/model_repository/$(dirname "$rel_path")"
+        cp -v "$py_file" "$dest_dir/" || true
+      done
+
+      for config_file in $(find routers/ -name "config.pbtxt"); do
+        rel_path=$(echo "$config_file" | sed 's|routers/||')
+        dest_dir="/model_repository/$(dirname "$rel_path")"
+        cp -v "$config_file" "$dest_dir/" || true
+      done
 
       echo "✅ Models downloaded directly to PVC"
       find /model_repository -name "*.pt" -exec ls -lh {} \;
@@ -344,22 +308,15 @@ oc logs deployment/llm-router-router-server | grep "successfully loaded"
 
 #### **Method 2: RHOAI Notebook Integration**
 
-For users with RHOAI workbench notebooks:
+For users with RHOAI workbench environments:
 
-```bash
-# From your RHOAI notebook, if using the same RWX PVC:
-# 1. Run the model download in notebook
-export NGC_CLI_API_KEY="your-ngc-api-key"
-export NGC_CLI_ORG="nvidia/nemo"
-make download
+1. **Configure Workbench**: Ensure your RHOAI workbench has the same RWX PVC attached that the LLM Router router-server uses for model storage
 
-# 2. Copy models to shared PVC location
-# (Adjust paths based on your PVC mount point)
-cp -r routers/* /path/to/shared/pvc/model_repository/
+2. **Run Deployment Notebook**: Execute [launchable/1_Deploy_LLM_Router.ipynb](../launchable/1_Deploy_LLM_Router.ipynb) from your RHOAI workbench
 
-# 3. Restart LLM Router deployment
-# From OpenShift console or CLI
-```
+3. **Verify Shared Storage**: The notebook will download models to the shared PVC, making them available to the LLM Router deployment
+
+> **Note**: This method leverages RHOAI's notebook environment while ensuring models are downloaded to the shared storage accessible by the LLM Router pods.
 
 > **Alternative**: Manual routing provides the same functionality without these file transfer complications.
 
@@ -415,7 +372,7 @@ When `openshift.enabled: true`, the chart automatically configures:
 # values.yaml or --set overrides
 openshift:
   enabled: true                    # Enable OpenShift-specific features
-  storageClass: "gp3-csi"         # Default OpenShift storage class
+  storageClass: "ocs-storagecluster-cephfs"  # RWX storage class for model sharing
   routes:
     enabled: true                  # Create OpenShift Routes
     router:
@@ -427,6 +384,13 @@ openshift:
     app:
       host: ""
       enabled: true
+
+# Router Server Storage (Required for Triton Routing)
+routerServer:
+  persistence:
+    storageClass: "ocs-storagecluster-cephfs"  # Must be ReadWriteMany (RWX)
+    size: "100Gi"                 # Sufficient for NGC models (~1.5GB total)
+    accessMode: "ReadWriteMany"   # Required for model download pods
 ```
 
 ### Service Configuration
