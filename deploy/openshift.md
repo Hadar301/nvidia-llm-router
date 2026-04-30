@@ -4,13 +4,101 @@ This guide explains how to deploy the NVIDIA LLM Router on OpenShift using the p
 
 ## Prerequisites
 
-- OpenShift 4.10+ cluster with GPU nodes
-- Helm 3.2.0+
-- NVIDIA GPU Operator installed on OpenShift
-- [NVIDIA API key](https://build.nvidia.com/settings/api-keys) from NVIDIA API Catalog
-- [NGC API key](https://org.ngc.nvidia.com/setup/api-keys) for container registry access (base images)
-- Container images for router-server, router-controller, and app components
-- GPU node tolerations configured (if using tainted GPU nodes)
+### Common Requirements (All Deployments)
+- **OpenShift Cluster**: 4.10+ with minimum 3 worker nodes (4 vCPU, 16GB RAM each)
+- **Helm**: 3.2.0+ installed and configured
+- **NVIDIA API Key**: From [NVIDIA API Catalog](https://build.nvidia.com/settings/api-keys)
+  - Format: `nvapi-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx` (47 characters)
+  - Required scopes: Model access for routing
+- **NGC API Key**: From [NGC Portal](https://org.ngc.nvidia.com/setup/api-keys) 
+  - Format: 40+ alphanumeric characters
+  - Required for: Container registry access and model downloads
+- **Container Images**: Pre-built images for router-controller and app components
+  - Must be pushed to accessible container registry
+  - Architecture: linux/amd64 (OpenShift standard)
+- **Network Access**: Outbound HTTPS to `api.nvidia.com`, `build.nvidia.com`, `api.ngc.nvidia.com`
+
+### Additional Requirements (Triton Routing Only)
+- **GPU Hardware**: Nodes with 16GB+ VRAM (Tesla T4, V100, A10, A100, etc.)
+- **NVIDIA GPU Operator**: Installed and validated on OpenShift cluster
+- **Storage**: ReadWriteMany (RWX) storage class (CephFS, NFS, etc.)
+- **Network**: Egress access to api.ngc.nvidia.com and build.nvidia.com
+- **Container Images**: router-server component built for your architecture
+- **GPU Node Configuration**: Tolerations for tainted GPU nodes (if applicable)
+
+### Cluster Resource Verification
+
+```bash
+# Check cluster resources before deployment
+echo "=== Cluster Resource Check ==="
+
+# Check for GPU nodes
+GPU_NODES=$(oc get nodes -l feature.node.kubernetes.io/pci-10de.present=true --no-headers 2>/dev/null | wc -l)
+if [ "$GPU_NODES" -eq 0 ]; then
+  echo "⚠️  Warning: No GPU nodes detected. Manual routing only."
+else
+  echo "✅ GPU nodes available: $GPU_NODES"
+  oc get nodes -l feature.node.kubernetes.io/pci-10de.present=true -o custom-columns=NAME:.metadata.name,GPU:.status.allocatable.nvidia\.com/gpu
+fi
+
+# Check storage classes
+echo -e "\n=== Available Storage Classes ==="
+oc get storageclass -o custom-columns=NAME:.metadata.name,PROVISIONER:.provisioner,RECLAIM:.reclaimPolicy
+
+# Check for RWX storage
+RWX_STORAGE=$(oc get storageclass -o json | jq -r '.items[] | select(.volumeBindingMode != "WaitForFirstConsumer") | .metadata.name' | grep -E "(ceph|nfs|efs)" | head -1)
+if [ -n "$RWX_STORAGE" ]; then
+  echo "✅ RWX-compatible storage class found: $RWX_STORAGE"
+else
+  echo "⚠️  Warning: No obvious RWX storage class found. Verify with cluster admin."
+fi
+
+# Check NVIDIA GPU Operator
+echo -e "\n=== NVIDIA GPU Operator Status ==="
+if oc get pods -n nvidia-gpu-operator &>/dev/null; then
+  oc get pods -n nvidia-gpu-operator --no-headers | awk '{print $1 ": " $3}'
+else
+  echo "❌ NVIDIA GPU Operator not found. Install before proceeding with Triton routing."
+fi
+
+echo -e "\n=== Network Connectivity Test ==="
+# Test egress to NVIDIA APIs
+curl -s --max-time 5 https://api.nvidia.com/healthcheck && echo "✅ NVIDIA API accessible" || echo "❌ NVIDIA API unreachable"
+curl -s --max-time 5 https://api.ngc.nvidia.com/v2/resources &>/dev/null && echo "✅ NGC API accessible" || echo "❌ NGC API unreachable"
+```
+
+## Routing Strategy Overview
+
+The NVIDIA LLM Router supports two routing approaches with **different infrastructure requirements**:
+
+### Manual Routing (Recommended for Production)
+- **What it is**: Direct policy-based routing to NVIDIA's hosted models  
+- **Components**: router-controller + app (demo)
+- **Infrastructure**: Standard OpenShift nodes (no GPU required)
+- **Cost**: Low - uses standard compute instances
+- **Setup**: Simple - works immediately with NVIDIA API keys
+
+### Triton Routing (Advanced/Development)
+- **What it is**: ML-based classification using local routing models
+- **Components**: router-controller + router-server + app (demo)  
+- **Infrastructure**: GPU nodes (16GB+ VRAM required)
+- **Cost**: High - requires expensive GPU instances
+- **Setup**: Complex - model downloads, file transfers, cache configuration
+
+### Which Should You Choose?
+
+**Choose Manual Routing if**:
+- ✅ You want production-ready deployment
+- ✅ You need cost-effective infrastructure
+- ✅ You want immediate functionality
+- ✅ You're evaluating the LLM Router
+- ✅ Policy-based routing meets your needs
+
+**Choose Triton Routing only if**:
+- 🔬 You need custom ML-based routing logic
+- 🔬 You're doing research/development work
+- 🔬 You have budget for GPU infrastructure
+- 🔬 You can handle complex model file management
 
 ## Quick Start
 
@@ -20,21 +108,65 @@ This guide explains how to deploy the NVIDIA LLM Router on OpenShift using the p
 # Create namespace (replace 'your-namespace' with your preferred name)
 oc new-project your-namespace
 
-# Create NVIDIA API key secret (required for manual routing)
-oc create secret generic llm-api-keys \
-  --from-literal=nvidia_api_key=nvapi-YOUR-NVIDIA-API-KEY
+# Set and validate environment variables
+export NVIDIA_API_KEY="nvapi-YOUR-NVIDIA-API-KEY"
+export NGC_API_KEY="YOUR-NGC-API-KEY"
 
-# Create NGC registry secret for NVIDIA base images  
+# Validate NVIDIA API key format (should start with 'nvapi-' and be ~47 characters)
+if [[ ! "$NVIDIA_API_KEY" =~ ^nvapi-.{40,}$ ]]; then
+  echo "❌ Error: Invalid NVIDIA API key format. Should start with 'nvapi-' followed by 40+ characters"
+  echo "Get your key from: https://build.nvidia.com/settings/api-keys"
+  exit 1
+fi
+
+# Validate NGC API key format (should be alphanumeric, 40+ characters)
+if [[ ! "$NGC_API_KEY" =~ ^[A-Za-z0-9]{40,}$ ]]; then
+  echo "❌ Error: Invalid NGC API key format. Should be 40+ alphanumeric characters"
+  echo "Get your key from: https://org.ngc.nvidia.com/setup/api-keys"
+  exit 1
+fi
+
+echo "✅ API keys validated successfully"
+
+# Create NVIDIA API key secret (required for all deployments)
+oc create secret generic llm-api-keys \
+  --from-literal=nvidia_api_key="$NVIDIA_API_KEY"
+
+# Create NGC registry secret for NVIDIA base images
 oc create secret docker-registry nvcr-secret \
   --docker-server=nvcr.io \
   --docker-username='$oauthtoken' \
-  --docker-password=YOUR-NGC-API-KEY
+  --docker-password="$NGC_API_KEY"
 ```
 
-### 2. Deploy with OpenShift Support
+### 2. Choose Your Deployment Path
+
+#### **Option A: Manual Routing (Recommended)**
+**Cost-effective deployment with immediate functionality**
 
 ```bash
-# Complete deployment (includes both routing strategies)
+# Manual routing deployment (no GPU required)
+helm install llm-router ./deploy/helm/llm-router \
+  --set openshift.enabled=true \
+  --set app.enabled=true \
+  --set routerServer.enabled=false \
+  --set routerController.enabled=true \
+  --set global.imageRegistry=your-registry.com/namespace/ \
+  --set routerController.image.tag=your-tag \
+  --set app.image.tag=your-tag
+```
+
+> **Automatic OpenShift Configuration**: When `openshift.enabled=true`, the chart automatically configures:
+> - **CephFS storage** (`ocs-storagecluster-cephfs`) with **ReadWriteMany** for concurrent pod access
+> - **OpenShift Routes** instead of Kubernetes Ingress  
+> - **Security contexts** compliant with `restricted-v2` SCC
+> - **HuggingFace cache** redirection for proper permissions
+
+#### **Option B: Triton Routing (Advanced)**
+**GPU deployment with ML-based routing**
+
+```bash
+# Triton routing deployment (GPU required + cache configuration)
 helm install llm-router ./deploy/helm/llm-router \
   --set openshift.enabled=true \
   --set app.enabled=true \
@@ -43,93 +175,24 @@ helm install llm-router ./deploy/helm/llm-router \
   --set global.imageRegistry=your-registry.com/namespace/ \
   --set routerServer.image.tag=your-tag \
   --set routerController.image.tag=your-tag \
-  --set app.image.tag=your-tag
+  --set app.image.tag=your-tag \
+  --set routerServer.env[0].name=HF_DATASETS_CACHE \
+  --set routerServer.env[0].value="/tmp/hf_cache" \
+  --set routerServer.env[1].name=HUGGINGFACE_HUB_CACHE \
+  --set routerServer.env[1].value="/tmp/hf_cache" \
+  --set routerServer.env[2].name=TRANSFORMERS_CACHE \
+  --set routerServer.env[2].value="/tmp/hf_cache" \
+  --set routerServer.env[3].name=HOME \
+  --set routerServer.env[3].value="/tmp"
 ```
 
-> **Note**: 
-> - Manual routing works immediately after deployment
-> - GPU nodes with taints require additional tolerations (see [GPU Configuration](#gpu-configuration))  
-> - Triton routing requires additional model download steps (see section 4)
+> **Important Notes**:
+> - **Manual routing** provides complete LLM routing functionality without GPU infrastructure
+> - **Triton routing** requires GPU nodes and additional model setup (see section 4)
+> - **Cache configuration** is only required for Triton routing (router-server component)
+> - **Cost consideration**: Manual routing uses standard nodes, Triton routing requires expensive GPU nodes
 
-### 3. Prepare for Model Routing
-
-The NVIDIA LLM Router supports two routing approaches that work differently on OpenShift:
-
-#### **Manual Routing (Recommended)**
-- **Ready immediately**: Works with API keys, no model downloads required
-- **Production ready**: Uses NVIDIA's Build API for reliable model access
-- **OpenShift compatible**: No file transfer or storage issues
-
-#### **Triton Routing (Advanced)**
-- **Requires model files**: Needs NGC model downloads and file transfers
-- **Complex setup**: File transfer challenges in OpenShift environments
-- **Development focused**: Best suited for custom model development
-
-For most users, **manual routing provides complete functionality** and is recommended for OpenShift deployments.
-
-### 4. Download and Copy Models (Optional - For Triton Routing)
-
-If you need Triton routing with NGC models, follow these steps:
-
-#### **Step 1: Download Models Locally**
-
-```bash
-# Install NGC CLI and download models locally
-export NGC_CLI_API_KEY="your-ngc-api-key"
-export NGC_CLI_ORG="nvidia/nemo"
-
-# Option A: Use Makefile (requires NGC CLI setup)
-make download
-
-# Option B: Use Jupyter notebook
-jupyter lab --notebook-dir=launchable/
-# Run 1_Deploy_LLM_Router.ipynb with NGC_API_Key set
-```
-
-#### **Step 2: Transfer Models to OpenShift**
-
-⚠️ **Warning**: This process can be unreliable with large files. Model files are ~700MB each and may get corrupted during transfer.
-
-```bash
-# Get the router-server pod name
-ROUTER_POD=$(oc get pods -l app.kubernetes.io/component=router-server -o jsonpath='{.items[0].metadata.name}')
-
-# Copy model files directly to running pod - these operations may fail due to large file sizes
-oc cp routers/task_router/1/model.pt $ROUTER_POD:/model_repository/task_router/1/
-oc cp routers/complexity_router/1/model.pt $ROUTER_POD:/model_repository/complexity_router/1/
-
-# Verify file sizes match (736MB each)
-oc exec $ROUTER_POD -- ls -lh /model_repository/*/1/model.pt
-
-# Restart router-server to reload models
-oc rollout restart deployment/llm-router-router-server
-
-# Verify models loaded successfully
-oc logs deployment/llm-router-router-server | grep -E "successfully loaded"
-```
-
-**Common Issues**:
-- `oc cp` may fail with "unexpected EOF" for large files
-- File corruption during transfer (check file sizes)  
-- Network timeouts with 700MB+ files
-- May require multiple retry attempts
-
-**Troubleshooting**:
-```bash
-# If transfer fails, verify source file size
-ls -lh routers/*/1/model.pt
-
-# Check if transferred file is complete (should be ~736MB each)
-ROUTER_POD=$(oc get pods -l app.kubernetes.io/component=router-server -o jsonpath='{.items[0].metadata.name}')
-oc exec $ROUTER_POD -- ls -lh /model_repository/*/1/model.pt
-
-# If corrupted, delete and retry
-oc exec $ROUTER_POD -- rm /model_repository/*/1/model.pt
-```
-
-> **Alternative**: Manual routing provides the same functionality without these file transfer complications.
-
-### 5. Access the Application
+### 3. Access the Application
 
 ```bash
 # Get the route URLs
@@ -139,40 +202,185 @@ oc get routes
 https://llm-router-app-<your-namespace>.<cluster-domain>/
 ```
 
-## Routing Strategies
+**Using the Application**:
+- **Manual routing**: Works immediately - select "manual" routing strategy in the UI
+- **Triton routing**: Requires additional model setup (see section 4) before using "triton" routing strategy
 
-The NVIDIA LLM Router supports two approaches for routing requests to language models:
+### 4. Triton Routing Model Setup (Advanced)
 
-### Manual Routing (Recommended)
-**What it does**: Direct model selection based on predefined policies and user preferences
+For environments that need Triton routing with ML-based routing decisions:
 
-**Advantages**:
-- ✅ **Ready immediately**: Works with just NVIDIA API keys
-- ✅ **Reliable**: Uses NVIDIA's Build API infrastructure  
-- ✅ **OpenShift compatible**: No file transfers or storage complexity
-- ✅ **Production ready**: Proven reliability for enterprise deployments
-- ✅ **Full functionality**: Complete LLM Router capabilities
+#### **Prerequisites for Model Downloads**
 
-**Use cases**:
-- Production deployments
-- Testing and evaluation
-- When you want reliable model routing without infrastructure complexity
+**Storage Requirements**:
+- The deployment must use **ReadWriteMany (RWX) PVC** for model storage
+- Required for shared access between download and inference pods
+- **RHOAI Users**: If using RHOAI workbench, configure the LLM Router to use the same RWX PVC as your notebooks
 
-### Triton Routing (Advanced)
-**What it does**: ML-based routing using Triton Inference Server with custom routing models
+**Verify PVC Configuration**:
+```bash
+# Check that model storage PVC is RWX and get actual PVC name
+PVC_NAME=$(oc get pvc -o custom-columns=NAME:.metadata.name,ACCESS:.spec.accessModes --no-headers | grep ReadWriteMany | head -1 | awk '{print $1}')
 
-**Requirements**:
-- ❗ **NGC model downloads**: Requires downloading ~700MB model files
-- ❗ **File transfers**: Complex model file management in OpenShift
-- ❗ **Storage overhead**: Significant PVC space requirements
-- ❗ **Cache configuration**: HuggingFace model caching setup
+if [ -z "$PVC_NAME" ]; then
+  echo "❌ Error: No ReadWriteMany PVC found. Triton routing requires RWX storage."
+  echo "Available PVCs:"
+  oc get pvc
+  exit 1
+fi
 
-**Use cases**:
-- Custom model development
-- Research environments
-- When you need ML-based routing decisions
+echo "✅ Found RWX PVC: $PVC_NAME"
+export MODEL_PVC_NAME="$PVC_NAME"
+```
 
-> **Recommendation**: Start with manual routing for immediate functionality. Triton routing adds operational complexity without additional end-user features for most use cases.
+#### **Method 1: Direct Download Pod (Recommended)**
+
+This method downloads NGC models directly to the PVC, avoiding file transfer issues:
+
+**Step 1: Create Download ConfigMap**
+```bash
+# Create ConfigMap with Makefile for NGC downloads
+# Note: Ensure you're in the project root directory containing the Makefile
+oc create configmap download-makefile --from-file=Makefile -n your-namespace
+
+# Verify Makefile was added correctly
+oc describe configmap download-makefile | grep -A5 "Data"
+```
+
+**Step 2: Apply Download Pod**
+```yaml
+# download-models.yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: ngc-model-downloader
+  namespace: your-namespace
+spec:
+  restartPolicy: Never
+  securityContext:
+    runAsUser: 1000970000
+    runAsGroup: 1000970000
+    fsGroup: 1000970000
+  containers:
+  - name: downloader
+    image: registry.redhat.io/rhel8/python-39:latest
+    command: ["/bin/bash"]
+    args:
+    - -c
+    - |
+      cd /workspace
+      mkdir -p routers
+      export NGC_CLI_API_KEY="$NGC_API_KEY"
+      export NGC_CLI_ORG="nvidia/nemo"
+      make download
+
+      # Create model repository structure
+      mkdir -p /model_repository/{task_router,complexity_router}/1
+      mkdir -p /model_repository/{task_router_ensemble,complexity_router_ensemble}/1
+      mkdir -p /model_repository/{preprocessing_task_router,postprocessing_task_router}/1
+      mkdir -p /model_repository/{preprocessing_complexity_router,postprocessing_complexity_router}/1
+
+      # Copy models (702MB each)
+      cp -v routers/task_router/1/model.pt /model_repository/task_router/1/model.pt
+      cp -v routers/complexity_router/1/model.pt /model_repository/complexity_router/1/model.pt
+
+      # Copy configuration and Python files
+      find routers/ -name "*.py" -exec cp -v {} /model_repository/$(dirname {} | sed 's|routers/||')/ \;
+      find routers/ -name "config.pbtxt" -exec cp -v {} /model_repository/$(dirname {} | sed 's|routers/||')/ \;
+
+      echo "✅ Models downloaded directly to PVC"
+      find /model_repository -name "*.pt" -exec ls -lh {} \;
+    env:
+    - name: NGC_API_KEY
+      valueFrom:
+        secretKeyRef:
+          name: llm-api-keys
+          key: nvidia_api_key
+    volumeMounts:
+    - name: workspace
+      mountPath: /workspace
+    - name: makefile-volume
+      mountPath: /workspace/Makefile
+      subPath: Makefile
+    - name: model-repository
+      mountPath: /model_repository
+    workingDir: /workspace
+    resources:
+      requests:
+        memory: "2Gi"
+        cpu: "1"
+      limits:
+        memory: "4Gi"
+        cpu: "2"
+  volumes:
+  - name: workspace
+    emptyDir:
+      sizeLimit: 10Gi
+  - name: makefile-volume
+    configMap:
+      name: download-makefile
+  - name: model-repository
+    persistentVolumeClaim:
+      claimName: "$MODEL_PVC_NAME"  # Dynamically determined RWX PVC
+```
+
+**Step 3: Run Download**
+```bash
+# Apply the download pod
+oc apply -f download-models.yaml
+
+# Monitor progress
+oc logs -f ngc-model-downloader
+
+# Wait for completion
+oc wait --for=condition=Ready pod/ngc-model-downloader --timeout=300s
+
+# IMPORTANT: Restart router-server to load the downloaded models
+oc rollout restart deployment/llm-router-router-server
+
+# Verify models loaded successfully
+oc logs deployment/llm-router-router-server | grep "successfully loaded"
+```
+
+#### **Method 2: RHOAI Notebook Integration**
+
+For users with RHOAI workbench notebooks:
+
+```bash
+# From your RHOAI notebook, if using the same RWX PVC:
+# 1. Run the model download in notebook
+export NGC_CLI_API_KEY="your-ngc-api-key"
+export NGC_CLI_ORG="nvidia/nemo"
+make download
+
+# 2. Copy models to shared PVC location
+# (Adjust paths based on your PVC mount point)
+cp -r routers/* /path/to/shared/pvc/model_repository/
+
+# 3. Restart LLM Router deployment
+# From OpenShift console or CLI
+```
+
+> **Alternative**: Manual routing provides the same functionality without these file transfer complications.
+
+
+## Architecture and Routing Strategies
+
+The NVIDIA LLM Router supports two routing strategies. For detailed information about the architecture and components, see the main [README.md](../README.md#software-components).
+
+### Key Differences for OpenShift Deployment
+
+| Aspect | Manual Routing | Triton Routing |
+|--------|----------------|----------------|
+| **Components** | router-controller only | router-controller + router-server |
+| **Infrastructure** | Standard nodes | GPU nodes (16GB+ VRAM) |
+| **Setup Complexity** | Simple | Complex (model downloads) |
+| **Cost** | Low | High (GPU instances) |
+| **OpenShift Compatibility** | Excellent | Requires file transfer workarounds |
+
+> **For complete architecture details and configuration options**, refer to:
+> - [Main Documentation](../README.md) - Overall architecture and components
+> - [Router Controller README](../src/router-controller/readme.md) - API and configuration details
 
 ## OpenShift-Specific Features
 
@@ -192,6 +400,8 @@ When `openshift.enabled: true`, the chart automatically configures:
 ### Storage
 - **Default Storage Class**: Uses `gp3-csi` for OpenShift environments
 - **PVC Creation**: Automatic persistent volume provisioning for model storage
+- **Access Mode**: ReadWriteMany (RWX) required for Triton routing model downloads
+- **RHOAI Integration**: Compatible with RHOAI workbench shared storage
 
 ### RBAC
 - **ServiceAccount**: Dedicated service account with minimal permissions
@@ -233,9 +443,11 @@ app:
   enabled: true                    # Optional Gradio demo UI
 ```
 
-### Cache Configuration (Required for OpenShift)
+### Cache Configuration (Required for Triton Routing Only)
 
-OpenShift security contexts prevent writing to the root filesystem, which causes HuggingFace cache permission errors. Configure proper cache directories:
+**Note**: This configuration is only needed when `routerServer.enabled=true` (Triton routing).
+
+OpenShift security contexts prevent writing to the root filesystem, which causes HuggingFace cache permission errors in the router-server component. Configure proper cache directories:
 
 ```yaml
 # values.yaml or --set overrides
@@ -257,28 +469,27 @@ routerServer:
       mountPath: /tmp/hf_cache
 ```
 
-**Deploy with cache configuration:**
-```bash
-helm install llm-router ./deploy/helm/llm-router \
-  --set openshift.enabled=true \
-  --set routerServer.env[0].name=HF_DATASETS_CACHE \
-  --set routerServer.env[0].value="/tmp/hf_cache" \
-  --set routerServer.env[1].name=HUGGINGFACE_HUB_CACHE \
-  --set routerServer.env[1].value="/tmp/hf_cache" \
-  --set routerServer.env[2].name=TRANSFORMERS_CACHE \
-  --set routerServer.env[2].value="/tmp/hf_cache" \
-  --set routerServer.env[3].name=HOME \
-  --set routerServer.env[3].value="/tmp"
-```
+**This cache configuration is already included in the Triton routing deployment command above.**
 
 ## Resource Requirements
 
+### Manual Routing Deployment
+| Component | CPU | Memory | GPU | Storage |
+|-----------|-----|--------|-----|---------|
+| router-controller | 0.5-1 core | 2Gi | - | - |
+| app (demo) | 0.1-0.5 core | 1Gi | - | - |
+| **Total** | **0.6-1.5 cores** | **3Gi** | **None** | **Standard PVC** |
+
+### Triton Routing Deployment  
 | Component | CPU | Memory | GPU | Storage |
 |-----------|-----|--------|-----|---------|
 | router-server | 2-4 cores | 8Gi | 1x NVIDIA GPU (16GB+ VRAM) | - |
 | router-controller | 0.5-1 core | 2Gi | - | - |
 | app (demo) | 0.1-0.5 core | 1Gi | - | - |
 | model-storage | - | - | - | 100Gi PVC |
+| **Total** | **2.6-5.5 cores** | **11Gi** | **1x GPU** | **100Gi+ PVC** |
+
+> **Cost Impact**: GPU instances typically cost 10-50x more than standard instances in cloud environments.
 
 ## Troubleshooting
 
@@ -338,17 +549,30 @@ tolerations:
     effect: NoSchedule
 ```
 
-Deploy with tolerations:
+Deploy Triton routing with tolerations:
 ```bash
+# Use the Triton routing deployment command from section 2 with tolerations file
 helm install llm-router ./deploy/helm/llm-router \
   --set openshift.enabled=true \
+  --set app.enabled=true \
   --set routerServer.enabled=true \
+  --set routerController.enabled=true \
   --set global.imageRegistry=your-registry.com/namespace/ \
   --set routerServer.image.tag=your-tag \
   --set routerController.image.tag=your-tag \
   --set app.image.tag=your-tag \
+  --set routerServer.env[0].name=HF_DATASETS_CACHE \
+  --set routerServer.env[0].value="/tmp/hf_cache" \
+  --set routerServer.env[1].name=HUGGINGFACE_HUB_CACHE \
+  --set routerServer.env[1].value="/tmp/hf_cache" \
+  --set routerServer.env[2].name=TRANSFORMERS_CACHE \
+  --set routerServer.env[2].value="/tmp/hf_cache" \
+  --set routerServer.env[3].name=HOME \
+  --set routerServer.env[3].value="/tmp" \
   -f gpu-tolerations.yaml
 ```
+
+> **Note**: GPU tolerations are only needed for Triton routing deployments.
 
 Check node taints:
 ```bash
@@ -493,17 +717,12 @@ routerServer:
 
 ## Image Building
 
-For OpenShift deployment, you need to build multi-architecture container images:
+For OpenShift deployment, you need to build container images:
 
-### Build Router Components
+### Images Required by Deployment Type
 
+**Manual Routing**:
 ```bash
-# Build router-server image
-podman build --platform=linux/amd64 \
-  -f src/router-server/router-server.dockerfile \
-  -t your-registry.com/router-server:your-tag .
-podman push your-registry.com/router-server:your-tag
-
 # Build router-controller image  
 podman build --platform=linux/amd64 \
   -f src/router-controller/router-controller.dockerfile \
@@ -515,6 +734,15 @@ podman build --platform=linux/amd64 \
   -f demo/app/app.dockerfile \
   -t your-registry.com/llm-router-client:your-tag .
 podman push your-registry.com/llm-router-client:your-tag
+```
+
+**Triton Routing** (all manual routing images plus):
+```bash
+# Build router-server image (GPU support required)
+podman build --platform=linux/amd64 \
+  -f src/router-server/router-server.dockerfile \
+  -t your-registry.com/router-server:your-tag .
+podman push your-registry.com/router-server:your-tag
 ```
 
 > **Architecture Note**: OpenShift typically runs on x86_64, so ensure images are built with `--platform=linux/amd64`.
