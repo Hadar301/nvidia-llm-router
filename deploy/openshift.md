@@ -75,11 +75,15 @@ echo "✅ API keys validated successfully"
 oc create secret generic llm-api-keys \
   --from-literal=nvidia_api_key="$NVIDIA_API_KEY"
 
-# Create NGC registry secret for NVIDIA base images
+# Create NGC registry secret for pulling container images from nvcr.io
 oc create secret docker-registry nvcr-secret \
   --docker-server=nvcr.io \
   --docker-username='$oauthtoken' \
   --docker-password="$NGC_API_KEY"
+
+# Create NGC CLI secret for model downloads (required for Triton routing only)
+oc create secret generic ngc-cli-key \
+  --from-literal=ngc_cli_api_key="$NGC_API_KEY"
 ```
 
 ### 2. Choose Your Deployment Path
@@ -162,18 +166,10 @@ For environments that need Triton routing with ML-based routing decisions:
 
 **Verify PVC Configuration**:
 ```bash
-# Check that model storage PVC is RWX and get actual PVC name
-PVC_NAME=$(oc get pvc -o custom-columns=NAME:.metadata.name,ACCESS:.spec.accessModes --no-headers | grep ReadWriteMany | head -1 | awk '{print $1}')
+# Verify the Helm-created PVC is RWX and bound
+oc get pvc llm-router-router-server-model-repo -o custom-columns=NAME:.metadata.name,ACCESS:.spec.accessModes,STATUS:.status.phase --no-headers
 
-if [ -z "$PVC_NAME" ]; then
-  echo "❌ Error: No ReadWriteMany PVC found. Triton routing requires RWX storage."
-  echo "Available PVCs:"
-  oc get pvc
-  exit 1
-fi
-
-echo "✅ Found RWX PVC: $PVC_NAME"
-export MODEL_PVC_NAME="$PVC_NAME"
+# Expected output: llm-router-router-server-model-repo   [ReadWriteMany]   Bound
 ```
 
 #### **Method 1: Direct Download Pod (Recommended)**
@@ -201,9 +197,7 @@ metadata:
 spec:
   restartPolicy: Never
   securityContext:
-    runAsUser: 1000970000
-    runAsGroup: 1000970000
-    fsGroup: 1000970000
+    runAsNonRoot: true
   containers:
   - name: downloader
     image: registry.redhat.io/rhel8/python-39:latest
@@ -258,8 +252,8 @@ spec:
     - name: NGC_API_KEY
       valueFrom:
         secretKeyRef:
-          name: llm-api-keys
-          key: nvidia_api_key
+          name: ngc-cli-key
+          key: ngc_cli_api_key
     volumeMounts:
     - name: workspace
       mountPath: /workspace
@@ -285,7 +279,7 @@ spec:
       name: download-makefile
   - name: model-repository
     persistentVolumeClaim:
-      claimName: "$MODEL_PVC_NAME"  # Dynamically determined RWX PVC
+      claimName: llm-router-router-server-model-repo  # Created by the Helm chart (verify with: oc get pvc)
 ```
 
 **Step 3: Run Download**
@@ -296,8 +290,8 @@ oc apply -f download-models.yaml
 # Monitor progress
 oc logs -f ngc-model-downloader
 
-# Wait for completion
-oc wait --for=condition=Ready pod/ngc-model-downloader --timeout=300s
+# Wait for completion (pod runs to completion, not Ready)
+oc wait --for=jsonpath='{.status.phase}'=Succeeded pod/ngc-model-downloader --timeout=600s
 
 # IMPORTANT: Restart router-server to load the downloaded models
 oc rollout restart deployment/llm-router-router-server
@@ -515,7 +509,7 @@ tolerations:
 
 Deploy Triton routing with tolerations:
 ```bash
-# Use the Triton routing deployment command from section 2 with tolerations file
+# Option 1: Using a values file (recommended)
 helm install llm-router ./deploy/helm/llm-router \
   --set openshift.enabled=true \
   --set app.enabled=true \
@@ -525,16 +519,41 @@ helm install llm-router ./deploy/helm/llm-router \
   --set routerServer.image.tag=your-tag \
   --set routerController.image.tag=your-tag \
   --set app.image.tag=your-tag \
-  --set routerServer.env[0].name=HF_DATASETS_CACHE \
-  --set routerServer.env[0].value="/tmp/hf_cache" \
-  --set routerServer.env[1].name=HUGGINGFACE_HUB_CACHE \
-  --set routerServer.env[1].value="/tmp/hf_cache" \
-  --set routerServer.env[2].name=TRANSFORMERS_CACHE \
-  --set routerServer.env[2].value="/tmp/hf_cache" \
-  --set routerServer.env[3].name=HOME \
-  --set routerServer.env[3].value="/tmp" \
+  --set 'routerServer.env[0].name=HF_DATASETS_CACHE' \
+  --set 'routerServer.env[0].value=/tmp/hf_cache' \
+  --set 'routerServer.env[1].name=HUGGINGFACE_HUB_CACHE' \
+  --set 'routerServer.env[1].value=/tmp/hf_cache' \
+  --set 'routerServer.env[2].name=TRANSFORMERS_CACHE' \
+  --set 'routerServer.env[2].value=/tmp/hf_cache' \
+  --set 'routerServer.env[3].name=HOME' \
+  --set 'routerServer.env[3].value=/tmp' \
   -f gpu-tolerations.yaml
+
+# Option 2: Using --set inline (note: use --set-string for the value field)
+helm install llm-router ./deploy/helm/llm-router \
+  --set openshift.enabled=true \
+  --set app.enabled=true \
+  --set routerServer.enabled=true \
+  --set routerController.enabled=true \
+  --set global.imageRegistry=your-registry.com/namespace/ \
+  --set routerServer.image.tag=your-tag \
+  --set routerController.image.tag=your-tag \
+  --set app.image.tag=your-tag \
+  --set 'routerServer.env[0].name=HF_DATASETS_CACHE' \
+  --set 'routerServer.env[0].value=/tmp/hf_cache' \
+  --set 'routerServer.env[1].name=HUGGINGFACE_HUB_CACHE' \
+  --set 'routerServer.env[1].value=/tmp/hf_cache' \
+  --set 'routerServer.env[2].name=TRANSFORMERS_CACHE' \
+  --set 'routerServer.env[2].value=/tmp/hf_cache' \
+  --set 'routerServer.env[3].name=HOME' \
+  --set 'routerServer.env[3].value=/tmp' \
+  --set 'tolerations[0].key=g5-gpu' \
+  --set 'tolerations[0].operator=Equal' \
+  --set-string 'tolerations[0].value=true' \
+  --set 'tolerations[0].effect=NoSchedule'
 ```
+
+> **Note**: Tolerations are applied at the top level (`.Values.tolerations`) and affect all components. When using `--set` inline, the `value` field must use `--set-string` to avoid Helm interpreting `true` as a boolean. Using `-f gpu-tolerations.yaml` avoids this issue.
 
 > **Note**: GPU tolerations are only needed for Triton routing deployments.
 
