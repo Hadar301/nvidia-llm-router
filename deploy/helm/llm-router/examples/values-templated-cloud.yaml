@@ -8,7 +8,7 @@ routerController:
     apiBase: "https://integrate.api.nvidia.com"
     models:
       # Task router models
-      brainstorming: "meta/llama-3.1-405b-instruct"  # Use larger model for brainstorming
+      brainstorming: "meta/llama-4-maverick-17b-128e-instruct"  # Use larger model for brainstorming
       chatbot: "mistralai/mixtral-8x22b-instruct-v0.1"
       classification: "meta/llama-3.1-8b-instruct"
       closedQA: "meta/llama-3.1-70b-instruct"
@@ -22,7 +22,7 @@ routerController:
       unknown: "meta/llama-3.1-8b-instruct"
       
       # Complexity router models
-      creativity: "meta/llama-3.1-405b-instruct"  # Use larger model for creativity
+      creativity: "meta/llama-4-maverick-17b-128e-instruct"  # Use larger model for creativity
       reasoning: "nvidia/llama-3.3-nemotron-super-49b-v1"
       contextualKnowledge: "meta/llama-3.1-70b-instruct" 
       fewShot: "meta/llama-3.1-70b-instruct"

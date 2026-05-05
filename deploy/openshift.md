@@ -21,7 +21,7 @@ This guide explains how to deploy the NVIDIA LLM Router on OpenShift using the p
 ### Additional Requirements (Triton Routing Only)
 - **GPU Hardware**: Nodes with 16GB+ VRAM (Tesla T4, V100, A10, A100, etc.)
 - **NVIDIA GPU Operator**: Installed and validated on OpenShift cluster
-- **Storage**: ReadWriteMany (RWX) storage class (CephFS, NFS, etc.)
+- **Storage**: Persistent storage for model repository. ReadWriteMany only if using a separate download pod (see [Triton Model Setup Guide](openshift-triton-model-setup.md))
 - **Network**: Egress access to api.ngc.nvidia.com and build.nvidia.com
 - **Container Images**: router-server component built for your architecture
 - **GPU Node Configuration**: Tolerations for tainted GPU nodes (if applicable)
@@ -104,7 +104,7 @@ helm install llm-router ./deploy/helm/llm-router \
 ```
 
 > **Automatic OpenShift Configuration**: When `openshift.enabled=true`, the chart automatically configures:
-> - **CephFS storage** (`ocs-storagecluster-cephfs`) with **ReadWriteMany** for concurrent pod access
+> - **Default storage class** (`gp3-csi` or `ocs-storagecluster-cephfs` depending on cluster configuration)
 > - **OpenShift Routes** instead of Kubernetes Ingress  
 > - **Security contexts** compliant with `restricted-v2` SCC
 > - **HuggingFace cache** redirection for proper permissions
@@ -153,166 +153,19 @@ https://llm-router-app-<your-namespace>.<cluster-domain>/
 - **Manual routing**: Works immediately - select "manual" routing strategy in the UI
 - **Triton routing**: Requires additional model setup (see section 4) before using "triton" routing strategy
 
-### 4. Triton Routing Model Setup (Advanced)
+### 4. Triton Model Setup (Required for Triton Routing)
 
-For environments that need Triton routing with ML-based routing decisions:
+By default, the Triton routing deployment (`routerServer.enabled=true`) creates a **ReadWriteOnce** PVC and starts the router-server with an empty model repository at `/model_repository`. The router-server (Triton Inference Server) will start successfully but will have **no models loaded** until you populate the model repository.
 
-#### **Prerequisites for Model Downloads**
+**You must load models before Triton routing will function.** For detailed instructions on downloading and loading NGC models into the router-server, see:
 
-**Storage Requirements**:
-- The deployment must use **ReadWriteMany (RWX) PVC** for model storage
-- Required for shared access between download and inference pods
-- **RHOAI Users**: If using RHOAI workbench, configure the LLM Router to use the same RWX PVC as your notebooks
+> **[Triton Model Setup Guide](openshift-triton-model-setup.md)**
 
-**Verify PVC Configuration**:
-```bash
-# Verify the Helm-created PVC is RWX and bound
-oc get pvc llm-router-router-server-model-repo -o custom-columns=NAME:.metadata.name,ACCESS:.spec.accessModes,STATUS:.status.phase --no-headers
+That guide covers two approaches:
+- **Option A: Download Pod with RWX PVC** -- Uses a separate Kubernetes pod to download models from NGC into a shared ReadWriteMany PVC
+- **Option B: Custom Docker Image with Runtime Download** -- Builds a custom router-server image that downloads models at container startup using a standard ReadWriteOnce PVC
 
-# Expected output: llm-router-router-server-model-repo   [ReadWriteMany]   Bound
-```
-
-#### **Method 1: Direct Download Pod (Recommended)**
-
-This method downloads NGC models directly to the PVC, avoiding file transfer issues:
-
-**Step 1: Create Download ConfigMap**
-```bash
-# Create ConfigMap with Makefile for NGC downloads
-# Note: Ensure you're in the project root directory containing the Makefile
-oc create configmap download-makefile --from-file=Makefile -n your-namespace
-
-# Verify Makefile was added correctly
-oc describe configmap download-makefile | grep -A5 "Data"
-```
-
-**Step 2: Apply Download Pod**
-```yaml
-# download-models.yaml
-apiVersion: v1
-kind: Pod
-metadata:
-  name: ngc-model-downloader
-  namespace: your-namespace
-spec:
-  restartPolicy: Never
-  securityContext:
-    runAsNonRoot: true
-  containers:
-  - name: downloader
-    image: registry.redhat.io/rhel8/python-39:latest
-    command: ["/bin/bash"]
-    args:
-    - -c
-    - |
-      echo "Installing system dependencies..."
-      yum install -y curl wget unzip libxcrypt-compat
-
-      echo "Creating routers directory..."
-      cd /workspace
-      mkdir -p routers
-
-      echo "Running make download..."
-      export NGC_CLI_API_KEY="$NGC_API_KEY"
-      export NGC_CLI_ORG="nvidia/nemo"
-      make download
-
-      echo "Download completed. Setting up model repository..."
-
-      # Create model repository structure
-      mkdir -p /model_repository/task_router/1
-      mkdir -p /model_repository/complexity_router/1
-      mkdir -p /model_repository/task_router_ensemble/1
-      mkdir -p /model_repository/complexity_router_ensemble/1
-      mkdir -p /model_repository/preprocessing_task_router/1
-      mkdir -p /model_repository/postprocessing_task_router/1
-      mkdir -p /model_repository/preprocessing_complexity_router/1
-      mkdir -p /model_repository/postprocessing_complexity_router/1
-
-      # Copy models (702MB each)
-      cp -v routers/task_router/1/model.pt /model_repository/task_router/1/model.pt
-      cp -v routers/complexity_router/1/model.pt /model_repository/complexity_router/1/model.pt
-
-      # Copy configuration and Python files with correct paths
-      for py_file in $(find routers/ -name "*.py"); do
-        rel_path=$(echo "$py_file" | sed 's|routers/||')
-        dest_dir="/model_repository/$(dirname "$rel_path")"
-        cp -v "$py_file" "$dest_dir/" || true
-      done
-
-      for config_file in $(find routers/ -name "config.pbtxt"); do
-        rel_path=$(echo "$config_file" | sed 's|routers/||')
-        dest_dir="/model_repository/$(dirname "$rel_path")"
-        cp -v "$config_file" "$dest_dir/" || true
-      done
-
-      echo "✅ Models downloaded directly to PVC"
-      find /model_repository -name "*.pt" -exec ls -lh {} \;
-    env:
-    - name: NGC_API_KEY
-      valueFrom:
-        secretKeyRef:
-          name: ngc-cli-key
-          key: ngc_cli_api_key
-    volumeMounts:
-    - name: workspace
-      mountPath: /workspace
-    - name: makefile-volume
-      mountPath: /workspace/Makefile
-      subPath: Makefile
-    - name: model-repository
-      mountPath: /model_repository
-    workingDir: /workspace
-    resources:
-      requests:
-        memory: "2Gi"
-        cpu: "1"
-      limits:
-        memory: "4Gi"
-        cpu: "2"
-  volumes:
-  - name: workspace
-    emptyDir:
-      sizeLimit: 10Gi
-  - name: makefile-volume
-    configMap:
-      name: download-makefile
-  - name: model-repository
-    persistentVolumeClaim:
-      claimName: llm-router-router-server-model-repo  # Created by the Helm chart (verify with: oc get pvc)
-```
-
-**Step 3: Run Download**
-```bash
-# Apply the download pod
-oc apply -f download-models.yaml
-
-# Monitor progress
-oc logs -f ngc-model-downloader
-
-# Wait for completion (pod runs to completion, not Ready)
-oc wait --for=jsonpath='{.status.phase}'=Succeeded pod/ngc-model-downloader --timeout=600s
-
-# IMPORTANT: Restart router-server to load the downloaded models
-oc rollout restart deployment/llm-router-router-server
-
-# Verify models loaded successfully
-oc logs deployment/llm-router-router-server | grep "successfully loaded"
-```
-
-#### **Method 2: RHOAI Notebook Integration**
-
-For users with RHOAI workbench environments:
-
-1. **Configure Workbench**: Ensure your RHOAI workbench has the same RWX PVC attached that the LLM Router router-server uses for model storage
-
-2. **Run Deployment Notebook**: Execute [launchable/1_Deploy_LLM_Router.ipynb](../launchable/1_Deploy_LLM_Router.ipynb) from your RHOAI workbench
-
-3. **Verify Shared Storage**: The notebook will download models to the shared PVC, making them available to the LLM Router deployment
-
-> **Note**: This method leverages RHOAI's notebook environment while ensuring models are downloaded to the shared storage accessible by the LLM Router pods.
-
-> **Alternative**: Manual routing provides the same functionality without these file transfer complications.
+Until models are loaded, the Triton routing strategy will not work.
 
 
 ## Architecture and Routing Strategies
@@ -327,7 +180,7 @@ The NVIDIA LLM Router supports two routing strategies. For detailed information 
 | **Infrastructure** | Standard nodes | GPU nodes (16GB+ VRAM) |
 | **Setup Complexity** | Simple | Complex (model downloads) |
 | **Cost** | Low | High (GPU instances) |
-| **OpenShift Compatibility** | Excellent | Requires file transfer workarounds |
+| **OpenShift Compatibility** | Excellent | Requires model setup (see [Model Setup Guide](openshift-triton-model-setup.md)) |
 
 > **For complete architecture details and configuration options**, refer to:
 > - [Main Documentation](../README.md) - Overall architecture and components
@@ -351,7 +204,7 @@ When `openshift.enabled: true`, the chart automatically configures:
 ### Storage
 - **Default Storage Class**: Uses `gp3-csi` for OpenShift environments
 - **PVC Creation**: Automatic persistent volume provisioning for model storage
-- **Access Mode**: ReadWriteMany (RWX) required for Triton routing model downloads
+- **Default Access Mode**: ReadWriteOnce (RWO). Override to ReadWriteMany if using download pods (see [Triton Model Setup Guide](openshift-triton-model-setup.md))
 - **RHOAI Integration**: Compatible with RHOAI workbench shared storage
 
 ### RBAC
@@ -366,7 +219,7 @@ When `openshift.enabled: true`, the chart automatically configures:
 # values.yaml or --set overrides
 openshift:
   enabled: true                    # Enable OpenShift-specific features
-  storageClass: "ocs-storagecluster-cephfs"  # RWX storage class for model sharing
+  storageClass: ""                           # Defaults to cluster default. Use "ocs-storagecluster-cephfs" for RWX
   routes:
     enabled: true                  # Create OpenShift Routes
     router:
@@ -382,9 +235,9 @@ openshift:
 # Router Server Storage (Required for Triton Routing)
 routerServer:
   persistence:
-    storageClass: "ocs-storagecluster-cephfs"  # Must be ReadWriteMany (RWX)
+    storageClass: ""                           # Defaults to cluster default. Use "ocs-storagecluster-cephfs" for RWX
     size: "100Gi"                 # Sufficient for NGC models (~1.5GB total)
-    accessMode: "ReadWriteMany"   # Required for model download pods
+    accessMode: "ReadWriteOnce"   # Override to ReadWriteMany for download pod approach
 ```
 
 ### Service Configuration
@@ -588,7 +441,7 @@ oc logs deployment/llm-router-router-server | grep -E "model|error|fail"
 
 **Solutions:**
 - Ensure cache configuration is applied (see Cache Configuration section)
-- Use temporary pod method for reliable large file transfers (see model download section)  
+- See the [Triton Model Setup Guide](openshift-triton-model-setup.md) for model download options
 - Verify PVC has sufficient space (recommend 100Gi+)
 - Consider manual routing as alternative
 

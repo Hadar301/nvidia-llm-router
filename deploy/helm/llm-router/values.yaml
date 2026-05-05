@@ -281,7 +281,7 @@ routerServer:
         persistentVolumeClaim:
           enabled: true
           storageClass: ""  # Use default storage class if empty (see openshift.storageClass for OpenShift)
-          accessMode: ReadWriteOnce  # Changed to ReadWriteMany automatically when openshift.enabled=true
+          accessMode: ReadWriteOnce  # Override to ReadWriteMany if using download pods for model loading
           size: "100Gi"
           # Optionally specify an existing PVC name
           existingClaim: ""
