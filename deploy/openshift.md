@@ -161,9 +161,10 @@ By default, the Triton routing deployment (`routerServer.enabled=true`) creates 
 
 > **[Triton Model Setup Guide](openshift-triton-model-setup.md)**
 
-That guide covers two approaches:
+That guide covers three approaches:
 - **Option A: Download Pod with RWX PVC** -- Uses a separate Kubernetes pod to download models from NGC into a shared ReadWriteMany PVC
 - **Option B: Custom Docker Image with Runtime Download** -- Builds a custom router-server image that downloads models at container startup using a standard ReadWriteOnce PVC
+- **Option C: MinIO + Init Container (Recommended)** -- Stores models in MinIO and syncs them to the PVC via an init container at pod startup
 
 Until models are loaded, the Triton routing strategy will not work.
 

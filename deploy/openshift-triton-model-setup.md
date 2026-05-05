@@ -9,16 +9,19 @@ By default, the Helm chart deploys the router-server with:
 - An **empty model repository** -- Triton Inference Server starts but has no models loaded
 - The `tritonserver` command launched directly via the Helm template's `command` field
 
-**You must populate the model repository before Triton routing will function.** This guide covers two approaches:
+**You must populate the model repository before Triton routing will function.** This guide covers three approaches:
 
-| Aspect | Option A: Download Pod | Option B: Custom Image |
-|--------|----------------------|----------------------|
-| **PVC Access Mode** | ReadWriteMany (RWX) required | ReadWriteOnce (default) |
-| **Storage Class** | CephFS (`ocs-storagecluster-cephfs`) | Any (e.g., `gp3-csi`) |
-| **Startup Time** | Fast (models pre-loaded on PVC) | Slower on first start (~5-10 min download) |
-| **Image Modification** | None | Custom Dockerfile required |
-| **Helm Template Modification** | None | Required (local only, not committed upstream) |
-| **Model Persistence** | On PVC, survives pod restarts | On PVC, downloaded once then skipped |
+| Aspect | Option A: Download Pod | Option B: Custom Image | Option C: MinIO + Init Container |
+|--------|----------------------|----------------------|--------------------------------|
+| **PVC Access Mode** | ReadWriteMany (RWX) required | ReadWriteOnce (default) | ReadWriteOnce (default) |
+| **Storage Class** | CephFS (`ocs-storagecluster-cephfs`) | Any (e.g., `gp3-csi`) | Any (e.g., `gp3-csi`) |
+| **Startup Time** | Fast (models pre-loaded on PVC) | Slower on first start (~5-10 min) | First start: ~2-5 min sync; restarts: seconds (delta only) |
+| **Image Modification** | None | Custom Dockerfile required | None |
+| **Helm Template Modification** | None | Required (local only) | Required (local only) |
+| **Model Persistence** | On PVC, survives pod restarts | On PVC, downloaded once then skipped | On PVC, delta-synced on each start |
+| **External Dependency** | NGC API (download time) | NGC API (first start) | MinIO instance (must be running) |
+| **Model Update Workflow** | Re-run download pod | Rebuild image or re-download | Upload to MinIO, restart pod |
+| **Customizer Integration** | Manual copy to PVC | Rebuild image | Upload to MinIO bucket |
 
 ## Prerequisites
 
@@ -393,6 +396,440 @@ oc logs -f deployment/llm-router-router-server
 
 ---
 
+## Option C: MinIO + Init Container (Recommended)
+
+This approach uses MinIO as a model store and an init container to sync models to the PVC before Triton starts. It requires no custom Docker images (unlike Option B) and works with standard RWO PVCs (unlike Option A). It does require local Helm chart modifications (not committed upstream).
+
+**How it works:**
+1. Models are uploaded to a MinIO bucket (one-time setup via an NGC-to-MinIO pod)
+2. On each pod start, an init container runs `mc mirror` to sync models from MinIO to the PVC
+3. Triton starts and serves from the PVC
+4. On restarts, `mc mirror` only syncs changed files (delta sync — takes seconds)
+
+### Step 1: Deploy MinIO on OpenShift
+
+Deploy a minimal single-node MinIO instance in the **same namespace** as the LLM Router. For production, consider the [MinIO Operator](https://min.io/docs/minio/kubernetes/upstream/).
+
+Save the following as `minio-deployment.yaml`:
+
+```yaml
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: minio-root-credentials
+type: Opaque
+stringData:
+  MINIO_ROOT_USER: "minioadmin"
+  MINIO_ROOT_PASSWORD: "change-me-to-a-secure-password"
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: minio-data
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 50Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: minio
+  labels:
+    app: minio
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: minio
+  template:
+    metadata:
+      labels:
+        app: minio
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: minio
+          image: quay.io/minio/minio:latest
+          args:
+            - server
+            - /data
+            - --console-address
+            - ":9001"
+          env:
+            - name: MINIO_ROOT_USER
+              valueFrom:
+                secretKeyRef:
+                  name: minio-root-credentials
+                  key: MINIO_ROOT_USER
+            - name: MINIO_ROOT_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: minio-root-credentials
+                  key: MINIO_ROOT_PASSWORD
+          ports:
+            - containerPort: 9000
+              name: api
+            - containerPort: 9001
+              name: console
+          volumeMounts:
+            - name: data
+              mountPath: /data
+          resources:
+            requests:
+              cpu: "250m"
+              memory: "512Mi"
+            limits:
+              cpu: "1"
+              memory: "1Gi"
+          securityContext:
+            allowPrivilegeEscalation: false
+            runAsNonRoot: true
+            capabilities:
+              drop:
+                - ALL
+            seccompProfile:
+              type: RuntimeDefault
+          readinessProbe:
+            httpGet:
+              path: /minio/health/ready
+              port: 9000
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /minio/health/live
+              port: 9000
+            initialDelaySeconds: 30
+            periodSeconds: 30
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: minio-data
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: minio
+spec:
+  selector:
+    app: minio
+  ports:
+    - name: api
+      port: 9000
+      targetPort: 9000
+    - name: console
+      port: 9001
+      targetPort: 9001
+  type: ClusterIP
+```
+
+```bash
+oc apply -f minio-deployment.yaml
+
+# Wait for MinIO to be ready
+oc wait --for=condition=Ready pod -l app=minio --timeout=120s
+```
+
+### Step 2: Download NGC Models to MinIO
+
+This pod downloads models from NVIDIA's NGC registry and uploads them directly to MinIO. It replaces `make download` and runs entirely on-cluster.
+
+Save the following as `ngc-to-minio.yaml`:
+
+> **Note**: This pod runs as non-root under OpenShift's `restricted-v2` SCC. It avoids `yum install` (requires root) and writes binaries to `$HOME` instead of system paths.
+
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: ngc-to-minio
+spec:
+  restartPolicy: Never
+  securityContext:
+    runAsNonRoot: true
+    seccompProfile:
+      type: RuntimeDefault
+  containers:
+  - name: uploader
+    image: registry.redhat.io/rhel8/python-39:latest
+    command: ["/bin/bash", "-c"]
+    args:
+    - |
+      set -e
+      cd /tmp
+
+      echo "Installing MinIO client..."
+      curl -sL https://dl.min.io/client/mc/release/linux-amd64/mc -o $HOME/mc
+      chmod +x $HOME/mc
+
+      echo "Installing NGC CLI..."
+      curl -sL https://api.ngc.nvidia.com/v2/resources/nvidia/ngc-apps/ngc_cli/versions/3.58.0/files/ngccli_linux.zip -o ngccli_linux.zip
+      python3 -m zipfile -e ngccli_linux.zip .
+      chmod +x ngc-cli/ngc
+
+      export NGC_CLI_ORG="nvidia/nemo"
+
+      echo "Downloading task router model..."
+      ngc-cli/ngc registry model download-version "nvidia/nemo/prompt-task-and-complexity-classifier:task-llm-router"
+
+      echo "Downloading complexity router model..."
+      ngc-cli/ngc registry model download-version "nvidia/nemo/prompt-task-and-complexity-classifier:complexity-llm-router"
+
+      echo "Configuring MinIO client..."
+      $HOME/mc alias set myminio http://minio:9000 "$MINIO_ACCESS_KEY" "$MINIO_SECRET_KEY" --insecure
+
+      $HOME/mc mb myminio/models --ignore-existing
+
+      echo "Uploading models to MinIO..."
+      $HOME/mc mirror prompt-task-and-complexity-classifier_vtask-llm-router/ myminio/models/ --insecure --overwrite
+      $HOME/mc mirror prompt-task-and-complexity-classifier_vcomplexity-llm-router/ myminio/models/ --insecure --overwrite
+
+      echo "Upload complete. Bucket contents:"
+      $HOME/mc ls myminio/models/ --recursive --insecure | head -30
+    env:
+    - name: NGC_CLI_API_KEY
+      valueFrom:
+        secretKeyRef:
+          name: ngc-cli-key
+          key: ngc_cli_api_key
+    - name: MINIO_ACCESS_KEY
+      valueFrom:
+        secretKeyRef:
+          name: minio-credentials
+          key: MINIO_ACCESS_KEY
+    - name: MINIO_SECRET_KEY
+      valueFrom:
+        secretKeyRef:
+          name: minio-credentials
+          key: MINIO_SECRET_KEY
+    - name: HOME
+      value: "/tmp"
+    resources:
+      requests:
+        memory: "2Gi"
+        cpu: "1"
+      limits:
+        memory: "4Gi"
+        cpu: "2"
+    securityContext:
+      allowPrivilegeEscalation: false
+      runAsNonRoot: true
+      capabilities:
+        drop:
+          - ALL
+      seccompProfile:
+        type: RuntimeDefault
+```
+
+```bash
+# Create the MinIO credentials secret (use the same credentials from minio-root-credentials)
+oc create secret generic minio-credentials \
+  --from-literal=MINIO_ACCESS_KEY="minioadmin" \
+  --from-literal=MINIO_SECRET_KEY="change-me-to-a-secure-password"
+
+# Run the NGC-to-MinIO pod
+oc apply -f ngc-to-minio.yaml
+
+# Monitor progress
+oc logs -f ngc-to-minio
+
+# Wait for completion
+oc wait --for=jsonpath='{.status.phase}'=Succeeded pod/ngc-to-minio --timeout=600s
+
+# Clean up the pod
+oc delete pod ngc-to-minio
+```
+
+### Step 3: Modify the Helm Chart (Local Only)
+
+> **Important**: These modifications are **not committed upstream**. Apply them locally before deploying.
+
+**Change 1: Add `modelSync` section to `values.yaml`**
+
+Add the following block at the end of the `routerServer:` section (after `shm_size: "8G"`), before the `routerController:` section:
+
+```yaml
+  # Model Sync Configuration (MinIO/S3 init container)
+  # Syncs models from an S3-compatible store to the local PVC before Triton starts.
+  # Requires openshift.enabled=true.
+  modelSync:
+    enabled: false
+    endpoint: "minio:9000"
+    bucket: "models"
+    path: ""
+    tls:
+      enabled: false
+    credentials:
+      secretName: "minio-credentials"
+      accessKeySecretKey: "MINIO_ACCESS_KEY"
+      secretKeySecretKey: "MINIO_SECRET_KEY"
+    image:
+      repository: "minio/mc"
+      tag: "latest"
+      pullPolicy: IfNotPresent
+    resources:
+      requests:
+        cpu: "100m"
+        memory: "128Mi"
+      limits:
+        cpu: "1"
+        memory: "512Mi"
+```
+
+**Change 2: Add init container to `router-server-deployment.yaml`**
+
+In `deploy/helm/llm-router/templates/router-server-deployment.yaml`, insert the following block **between** the `securityContext:` line (`{{- include "llm-router.podSecurityContext" . | nindent 8 }}`) and the `containers:` line:
+
+```yaml
+      {{- if and .Values.openshift.enabled .Values.routerServer.modelSync.enabled }}
+      initContainers:
+        - name: model-sync
+          image: "{{ .Values.routerServer.modelSync.image.repository }}:{{ .Values.routerServer.modelSync.image.tag }}"
+          imagePullPolicy: {{ .Values.routerServer.modelSync.image.pullPolicy }}
+          command:
+            - /bin/sh
+            - -c
+            - |
+              set -e
+              echo "Configuring MinIO client..."
+              mc alias set modelsrc \
+                {{ if .Values.routerServer.modelSync.tls.enabled }}https{{ else }}http{{ end }}://{{ .Values.routerServer.modelSync.endpoint }} \
+                "$MINIO_ACCESS_KEY" \
+                "$MINIO_SECRET_KEY" \
+                {{ if not .Values.routerServer.modelSync.tls.enabled }}--insecure{{ end }}
+
+              echo "Starting model sync..."
+              mc mirror --overwrite \
+                {{ if not .Values.routerServer.modelSync.tls.enabled }}--insecure{{ end }} \
+                modelsrc/{{ .Values.routerServer.modelSync.bucket }}{{ if .Values.routerServer.modelSync.path }}/{{ .Values.routerServer.modelSync.path }}{{ end }} \
+                {{ .Values.routerServer.volumes.modelRepository.mountPath }}/
+
+              echo "Model sync complete."
+              find {{ .Values.routerServer.volumes.modelRepository.mountPath }} -name "*.pt" -exec ls -lh {} \; 2>/dev/null || true
+          env:
+            - name: HOME
+              value: "/tmp"
+            - name: MINIO_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.routerServer.modelSync.credentials.secretName }}
+                  key: {{ .Values.routerServer.modelSync.credentials.accessKeySecretKey }}
+            - name: MINIO_SECRET_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.routerServer.modelSync.credentials.secretName }}
+                  key: {{ .Values.routerServer.modelSync.credentials.secretKeySecretKey }}
+          volumeMounts:
+            - name: model-repository
+              mountPath: {{ .Values.routerServer.volumes.modelRepository.mountPath }}
+          resources:
+            {{- toYaml .Values.routerServer.modelSync.resources | nindent 12 }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            runAsNonRoot: true
+            capabilities:
+              drop:
+                - ALL
+            seccompProfile:
+              type: RuntimeDefault
+      {{- end }}
+```
+
+> **Note**: `HOME=/tmp` is critical — the `mc` binary writes config to `$HOME/.mc/` and the default `/root` is not writable under OpenShift's `restricted-v2` SCC.
+
+### Step 4: Deploy LLM Router with Model Sync
+
+```bash
+helm install llm-router ./deploy/helm/llm-router \
+  --set openshift.enabled=true \
+  --set app.enabled=true \
+  --set routerServer.enabled=true \
+  --set routerController.enabled=true \
+  --set global.imageRegistry=your-registry.com/namespace/ \
+  --set routerServer.image.tag=your-tag \
+  --set routerController.image.tag=your-tag \
+  --set app.image.tag=your-tag \
+  --set routerServer.modelSync.enabled=true \
+  --set routerServer.modelSync.endpoint="minio:9000" \
+  --set routerServer.modelSync.bucket="models" \
+  --set routerServer.modelSync.credentials.secretName="minio-credentials" \
+  --set 'routerServer.env[0].name=HF_DATASETS_CACHE' \
+  --set 'routerServer.env[0].value=/tmp/hf_cache' \
+  --set 'routerServer.env[1].name=HUGGINGFACE_HUB_CACHE' \
+  --set 'routerServer.env[1].value=/tmp/hf_cache' \
+  --set 'routerServer.env[2].name=TRANSFORMERS_CACHE' \
+  --set 'routerServer.env[2].value=/tmp/hf_cache' \
+  --set 'routerServer.env[3].name=HOME' \
+  --set 'routerServer.env[3].value=/tmp'
+```
+
+### Step 5: Verify
+
+```bash
+# Check init container logs (model sync)
+oc logs deployment/llm-router-router-server -c model-sync
+
+# Check Triton logs (model loading)
+oc logs deployment/llm-router-router-server -c router-server | grep -E "model|loaded|failed"
+```
+
+### Updating Models
+
+To update models (e.g., after running the customizer):
+
+```bash
+# Upload new model files to MinIO
+# From a workstation with mc installed and port-forwarded, or from a pod:
+mc mirror path/to/triton_template/ myminio/models/ --insecure --overwrite
+
+# Restart the router-server to trigger a re-sync
+oc rollout restart deployment/llm-router-router-server
+```
+
+### Uploading Custom Models from Python
+
+When using the [router-builder customizer](../customize/router-builder/) from an RHOAI workbench or Jupyter notebook running in the same cluster, you can upload models directly to MinIO using the `minio` Python SDK:
+
+```bash
+pip install minio
+```
+
+```python
+import os
+from minio import Minio
+
+client = Minio(
+    "minio:9000",  # MinIO service in the same namespace
+    access_key="minioadmin",
+    secret_key="change-me-to-a-secure-password",
+    secure=False,
+)
+
+# Upload an entire triton_template directory to the models bucket
+template_dir = "triton_template/"
+for root, dirs, files in os.walk(template_dir):
+    for f in files:
+        local_path = os.path.join(root, f)
+        remote_path = os.path.relpath(local_path, template_dir)
+        client.fput_object("models", remote_path, local_path)
+        print(f"Uploaded: {remote_path}")
+```
+
+Then restart the router-server to pick up the new models:
+
+```bash
+oc rollout restart deployment/llm-router-router-server
+```
+
+---
+
 ## Troubleshooting
 
 ### Model Repository Issues
@@ -437,6 +874,6 @@ helm upgrade llm-router ./deploy/helm/llm-router \
   --set routerServer.volumes.modelRepository.storage.persistentVolumeClaim.storageClass=ocs-storagecluster-cephfs
 ```
 
-> **Recommendation**: If you are unsure which option to use, start with **Option A** (download pod) for simplicity. Use **Option B** (custom image) if you need to avoid RWX storage or want a self-contained deployment.
+> **Recommendation**: Start with **Option C** (MinIO + Init Container) -- it requires no custom images, no Helm template modifications, and works with standard RWO storage. Use **Option A** (download pod) if you already have RWX storage available. Use **Option B** (custom image) only if you need a fully self-contained deployment without external dependencies.
 
 Last updated: May 2026
