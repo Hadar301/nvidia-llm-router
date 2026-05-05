@@ -108,9 +108,5 @@ Storage class selection for OpenShift vs K8s
 Determine PVC access mode based on OpenShift configuration
 */}}
 {{- define "llm-router.accessMode" -}}
-{{- if .Values.openshift.enabled -}}
-ReadWriteMany
-{{- else -}}
 {{- .Values.routerServer.volumes.modelRepository.storage.persistentVolumeClaim.accessMode | default "ReadWriteOnce" -}}
-{{- end -}}
 {{- end -}} 
