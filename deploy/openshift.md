@@ -168,6 +168,18 @@ That guide covers three approaches:
 
 Until models are loaded, the Triton routing strategy will not work.
 
+### 5. Routing to Self-Hosted Models (Optional)
+
+By default, the LLM Router routes to NVIDIA's hosted Build API. If you have your own LLM inference endpoints running on the cluster — for example, models deployed via **Red Hat OpenShift AI (RHOAI)** model serving, KServe InferenceServices, or standalone vLLM instances — you can configure the router to use those instead.
+
+> **[Routing to Local OpenAI-Compatible Endpoints](routing-openshift-ai-models.md)**
+
+That guide covers:
+- Configuring the router-controller with custom model endpoints
+- Manual routing (client selects the model) and Triton routing (automatic classification)
+- Authentication with OpenShift OAuth bearer tokens
+- Mixing local and remote (NVIDIA Build API) endpoints in the same deployment
+
 
 ## Architecture and Routing Strategies
 
