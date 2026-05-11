@@ -4,18 +4,14 @@
 # This file enables OpenShift-specific features:
 # - Security contexts compatible with restricted-v2 SCC
 # - OpenShift Routes instead of Kubernetes Ingress
-# - CephFS storage class for ReadWriteMany support
 # - HuggingFace cache configuration for Triton routing
-# - MinIO-based model sync init container
+# - GPU node tolerations
 #
 # For full OpenShift deployment instructions, see deploy/openshift.md
 
 openshift:
   enabled: true
-  storageClass: "gp3-csi"
-  # Alternative storage classes:
-  # - "gp3-csi" (EBS) - ReadWriteOnce only, cheaper but no concurrent access
-  # - "ocs-storagecluster-cephfs" (CephFS) - ReadWriteMany, allows multiple pod access
+  storageClass: ""  # Uses cluster default. Override if needed (e.g., "gp3-csi", "ocs-storagecluster-cephfs")
   routes:
     enabled: true
     router:
