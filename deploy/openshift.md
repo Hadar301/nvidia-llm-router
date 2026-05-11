@@ -94,49 +94,42 @@ oc create secret generic ngc-cli-key \
 ```bash
 # Manual routing deployment (no GPU required)
 helm install llm-router ./deploy/helm/llm-router \
-  --set openshift.enabled=true \
+  -f ./deploy/helm/llm-router/openshift-values.yaml \
   --set app.enabled=true \
   --set routerServer.enabled=false \
-  --set routerController.enabled=true \
   --set global.imageRegistry=your-registry.com/namespace/ \
   --set routerController.image.tag=your-tag \
   --set app.image.tag=your-tag
 ```
 
-> **Automatic OpenShift Configuration**: When `openshift.enabled=true`, the chart automatically configures:
-> - **Default storage class** (`gp3-csi` or `ocs-storagecluster-cephfs` depending on cluster configuration)
+> **OpenShift values file**: The `openshift-values.yaml` file configures all OpenShift-specific settings:
+> - **Storage class** (`gp3-csi` by default)
 > - **OpenShift Routes** instead of Kubernetes Ingress  
 > - **Security contexts** compliant with `restricted-v2` SCC
 > - **HuggingFace cache** redirection for proper permissions
+> - **GPU tolerations** for tainted GPU nodes
+>
+> Review and adjust `openshift-values.yaml` for your cluster before deploying.
 
 #### **Option B: Triton Routing (Advanced)**
 **GPU deployment with ML-based routing**
 
 ```bash
-# Triton routing deployment (GPU required + cache configuration)
+# Triton routing deployment (GPU required)
 helm install llm-router ./deploy/helm/llm-router \
-  --set openshift.enabled=true \
+  -f ./deploy/helm/llm-router/openshift-values.yaml \
   --set app.enabled=true \
   --set routerServer.enabled=true \
-  --set routerController.enabled=true \
   --set global.imageRegistry=your-registry.com/namespace/ \
   --set routerServer.image.tag=your-tag \
   --set routerController.image.tag=your-tag \
-  --set app.image.tag=your-tag \
-  --set routerServer.env[0].name=HF_DATASETS_CACHE \
-  --set routerServer.env[0].value="/tmp/hf_cache" \
-  --set routerServer.env[1].name=HUGGINGFACE_HUB_CACHE \
-  --set routerServer.env[1].value="/tmp/hf_cache" \
-  --set routerServer.env[2].name=TRANSFORMERS_CACHE \
-  --set routerServer.env[2].value="/tmp/hf_cache" \
-  --set routerServer.env[3].name=HOME \
-  --set routerServer.env[3].value="/tmp"
+  --set app.image.tag=your-tag
 ```
 
 > **Important Notes**:
 > - **Manual routing** provides complete LLM routing functionality without GPU infrastructure
 > - **Triton routing** requires GPU nodes and additional model setup (see section 4)
-> - **Cache configuration** is only required for Triton routing (router-server component)
+> - **Cache and tolerations** are pre-configured in `openshift-values.yaml`
 > - **Cost consideration**: Manual routing uses standard nodes, Triton routing requires expensive GPU nodes
 
 ### 3. Access the Application
@@ -228,29 +221,40 @@ When `openshift.enabled: true`, the chart automatically configures:
 
 ### OpenShift Settings
 
+All OpenShift-specific settings are in `openshift-values.yaml`. Review and adjust before deploying:
+
 ```yaml
-# values.yaml or --set overrides
+# openshift-values.yaml (key sections)
 openshift:
-  enabled: true                    # Enable OpenShift-specific features
-  storageClass: ""                           # Defaults to cluster default. Use "ocs-storagecluster-cephfs" for RWX
+  enabled: true
+  storageClass: "gp3-csi"         # Adjust for your cluster
   routes:
-    enabled: true                  # Create OpenShift Routes
+    enabled: true
     router:
       host: ""                    # Auto-generated if empty
-      enabled: true
     controller:
       host: ""
-      enabled: true
     app:
       host: ""
-      enabled: true
 
-# Router Server Storage (Required for Triton Routing)
+# GPU tolerations (adjust key/value to match your cluster)
+tolerations:
+  - key: "g5-gpu"
+    operator: Equal
+    value: "true"
+    effect: NoSchedule
+```
+
+For Router Server storage (Triton Routing), override via `--set` or a separate values file:
+```yaml
 routerServer:
-  persistence:
-    storageClass: ""                           # Defaults to cluster default. Use "ocs-storagecluster-cephfs" for RWX
-    size: "100Gi"                 # Sufficient for NGC models (~1.5GB total)
-    accessMode: "ReadWriteOnce"   # Override to ReadWriteMany for download pod approach
+  volumes:
+    modelRepository:
+      storage:
+        persistentVolumeClaim:
+          storageClass: ""        # Uses openshift.storageClass via helper when empty
+          accessMode: ReadWriteOnce  # Override to ReadWriteMany for download pod approach
+          size: "100Gi"           # Sufficient for NGC models (~1.5GB total)
 ```
 
 ### Service Configuration
@@ -271,29 +275,12 @@ app:
 
 **Note**: This configuration is only needed when `routerServer.enabled=true` (Triton routing).
 
-OpenShift security contexts prevent writing to the root filesystem, which causes HuggingFace cache permission errors in the router-server component. Configure proper cache directories:
+OpenShift security contexts prevent writing to the root filesystem, which causes HuggingFace cache permission errors in the router-server component. The `openshift-values.yaml` file already includes the required cache configuration:
 
-```yaml
-# values.yaml or --set overrides
-routerServer:
-  env:
-    - name: HF_DATASETS_CACHE
-      value: "/tmp/hf_cache"
-    - name: HUGGINGFACE_HUB_CACHE
-      value: "/tmp/hf_cache"
-    - name: TRANSFORMERS_CACHE
-      value: "/tmp/hf_cache"
-    - name: HOME
-      value: "/tmp"
-  extraVolumes:
-    - name: hf-cache
-      emptyDir: {}
-  extraVolumeMounts:
-    - name: hf-cache
-      mountPath: /tmp/hf_cache
-```
+- HuggingFace cache env vars redirected to `/tmp/hf_cache`
+- An `emptyDir` volume mounted at `/tmp/hf_cache`
 
-**This cache configuration is already included in the Triton routing deployment command above.**
+No additional `--set` flags are needed when deploying with `-f openshift-values.yaml`.
 
 ## Resource Requirements
 
@@ -362,66 +349,18 @@ Many OpenShift GPU nodes have taints that prevent non-GPU workloads from schedul
 6 node(s) had untolerated taint {g5-gpu: true}
 ```
 
-Add the required toleration to your deployment:
+The `openshift-values.yaml` file includes a `tolerations` section. Edit it to match your cluster's GPU node taints:
 
 ```yaml
-# gpu-tolerations.yaml
+# In openshift-values.yaml
 tolerations:
-  - key: g5-gpu
+  - key: "g5-gpu"
     operator: Equal
     value: "true"
     effect: NoSchedule
 ```
 
-Deploy Triton routing with tolerations:
-```bash
-# Option 1: Using a values file (recommended)
-helm install llm-router ./deploy/helm/llm-router \
-  --set openshift.enabled=true \
-  --set app.enabled=true \
-  --set routerServer.enabled=true \
-  --set routerController.enabled=true \
-  --set global.imageRegistry=your-registry.com/namespace/ \
-  --set routerServer.image.tag=your-tag \
-  --set routerController.image.tag=your-tag \
-  --set app.image.tag=your-tag \
-  --set 'routerServer.env[0].name=HF_DATASETS_CACHE' \
-  --set 'routerServer.env[0].value=/tmp/hf_cache' \
-  --set 'routerServer.env[1].name=HUGGINGFACE_HUB_CACHE' \
-  --set 'routerServer.env[1].value=/tmp/hf_cache' \
-  --set 'routerServer.env[2].name=TRANSFORMERS_CACHE' \
-  --set 'routerServer.env[2].value=/tmp/hf_cache' \
-  --set 'routerServer.env[3].name=HOME' \
-  --set 'routerServer.env[3].value=/tmp' \
-  -f gpu-tolerations.yaml
-
-# Option 2: Using --set inline (note: use --set-string for the value field)
-helm install llm-router ./deploy/helm/llm-router \
-  --set openshift.enabled=true \
-  --set app.enabled=true \
-  --set routerServer.enabled=true \
-  --set routerController.enabled=true \
-  --set global.imageRegistry=your-registry.com/namespace/ \
-  --set routerServer.image.tag=your-tag \
-  --set routerController.image.tag=your-tag \
-  --set app.image.tag=your-tag \
-  --set 'routerServer.env[0].name=HF_DATASETS_CACHE' \
-  --set 'routerServer.env[0].value=/tmp/hf_cache' \
-  --set 'routerServer.env[1].name=HUGGINGFACE_HUB_CACHE' \
-  --set 'routerServer.env[1].value=/tmp/hf_cache' \
-  --set 'routerServer.env[2].name=TRANSFORMERS_CACHE' \
-  --set 'routerServer.env[2].value=/tmp/hf_cache' \
-  --set 'routerServer.env[3].name=HOME' \
-  --set 'routerServer.env[3].value=/tmp' \
-  --set 'tolerations[0].key=g5-gpu' \
-  --set 'tolerations[0].operator=Equal' \
-  --set-string 'tolerations[0].value=true' \
-  --set 'tolerations[0].effect=NoSchedule'
-```
-
-> **Note**: Tolerations are applied at the top level (`.Values.tolerations`) and affect all components. When using `--set` inline, the `value` field must use `--set-string` to avoid Helm interpreting `true` as a boolean. Using `-f gpu-tolerations.yaml` avoids this issue.
-
-> **Note**: GPU tolerations are only needed for Triton routing deployments.
+> **Note**: Tolerations are applied at the top level (`.Values.tolerations`) and affect all components. GPU tolerations are only needed for Triton routing deployments.
 
 Check node taints:
 ```bash
@@ -693,4 +632,4 @@ For issues specific to:
 |------------|-----------|-------------------|-------|
 | 0.1.0+ | 4.10+ | 23.6.1+ | Initial OpenShift support |
 
-Last updated: April 2026
+Last updated: May 2026
