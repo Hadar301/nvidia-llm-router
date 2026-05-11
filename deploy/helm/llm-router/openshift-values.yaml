@@ -1,0 +1,58 @@
+# OpenShift-specific values for LLM Router
+# Usage: helm install llm-router ./deploy/helm/llm-router -f openshift-values.yaml
+#
+# This file enables OpenShift-specific features:
+# - Security contexts compatible with restricted-v2 SCC
+# - OpenShift Routes instead of Kubernetes Ingress
+# - CephFS storage class for ReadWriteMany support
+# - HuggingFace cache configuration for Triton routing
+# - MinIO-based model sync init container
+#
+# For full OpenShift deployment instructions, see deploy/openshift.md
+
+openshift:
+  enabled: true
+  storageClass: "gp3-csi"
+  # Alternative storage classes:
+  # - "gp3-csi" (EBS) - ReadWriteOnce only, cheaper but no concurrent access
+  # - "ocs-storagecluster-cephfs" (CephFS) - ReadWriteMany, allows multiple pod access
+  routes:
+    enabled: true
+    router:
+      host: ""
+      enabled: true
+    controller:
+      host: ""
+      enabled: true
+    app:
+      host: ""
+      enabled: true
+
+# Router Server - OpenShift-specific overrides
+routerServer:
+  # HuggingFace cache environment variables
+  # Required on OpenShift to avoid permission errors from restricted security contexts
+  env:
+    - name: HF_DATASETS_CACHE
+      value: "/tmp/hf_cache"
+    - name: HUGGINGFACE_HUB_CACHE
+      value: "/tmp/hf_cache"
+    - name: TRANSFORMERS_CACHE
+      value: "/tmp/hf_cache"
+    - name: HOME
+      value: "/tmp"
+
+  extraVolumes:
+    - name: hf-cache
+      emptyDir: {}
+
+  extraVolumeMounts:
+    - name: hf-cache
+      mountPath: /tmp/hf_cache
+
+# GPU node tolerations
+tolerations:
+  - key: "g5-gpu"
+    operator: Equal
+    value: "true"
+    effect: NoSchedule
